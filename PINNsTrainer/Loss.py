@@ -1,87 +1,71 @@
 import contextlib
-
 import torch
-
+import torch.func as tf
 
 class Loss:
-    def ThetaDerivs(self, feats, create_graph=True):
-        # theta = net(t, IC); w = dθ/dt, a = d²θ/dt² via autograd (design 2.4, 3.1)
-        # feats: (M, 9) ; col 0 = t(seconds, leaf), col 1:9 = case-constant
-        # 시간에 대한 1·2차 autograd 미분으로 ω, 각가속도 유도
-        t = feats[:, 0:1].clone().requires_grad_(True)
+    def ThetaDerivs(self, feats, need_accel=True):
+        # theta = net(t, IC); w = dθ/dt, a = d²θ/dt² via forward-mode AD (jvp)
+        # feats: (M, 9) ; col 0 = t(seconds), col 1:9 = case-constant
+        # t가 행마다 스칼라라 forward-mode가 효율적 // jvp 중첩으로 1·2차 도함수 유도
+        t = feats[:, 0:1]
         rest = feats[:, 1:9]
-        full = torch.cat([t, rest], dim=1)
+        ones = torch.ones_like(t)
 
-        theta = self(full)                                # (M, 2) [θ1, θ2]
-        omega_cols, accel_cols = [], []
-        for i in range(theta.shape[1]):
-            g = torch.autograd.grad(
-                theta[:, i].sum(), t, create_graph=True, retain_graph=True
-            )[0]                                          # (M, 1) dθ_i/dt
-            a = torch.autograd.grad(
-                g.sum(), t, create_graph=create_graph, retain_graph=True
-            )[0]                                          # (M, 1) d²θ_i/dt²
-            omega_cols.append(g)
-            accel_cols.append(a)
-        omega = torch.cat(omega_cols, dim=1)              # (M, 2)
-        accel = torch.cat(accel_cols, dim=1)              # (M, 2)
+        def f(tc):                                        # (M, 1) -> (M, 2) [θ1, θ2]
+            return self(torch.cat([tc, rest], dim=1))
+
+        # Data path skips 2nd derivative // accel 불필요 시 jvp 1회로 단축
+        if not need_accel:
+            theta, omega = tf.jvp(f, (t,), (ones,))       # theta, dθ/dt
+            return theta, omega, None
+
+        def f_d(tc):                                      # (theta, dθ/dt)
+            return tf.jvp(f, (tc,), (ones,))
+
+        # forward-over-forward // d²θ/dt² = jvp의 jvp
+        (theta, omega), (_, accel) = tf.jvp(f_d, (t,), (ones,))
         return theta, omega, accel
 
     def DataLoss(self, feats, theta_true, omega_true):
-        # θ에 직접, ω는 autograd 유도값에 데이터 손실 (design 2.4) // θ + 유도 ω MSE
-        theta, omega, _ = self.ThetaDerivs(feats, create_graph=False)
+        theta, omega, _ = self.ThetaDerivs(feats, need_accel=False)
         return torch.mean((theta - theta_true) ** 2) + torch.mean(
             (omega - omega_true) ** 2
         )
 
-    def EnergyLoss(self, feats, params, e0):
-        # relative energy error |E(t)-E0|/|E0| (design 4.3) // 상대 에너지 보존 오차
-        theta, omega, _ = self.ThetaDerivs(feats, create_graph=False)
-        state = torch.stack(
-            [theta[:, 0], omega[:, 0], theta[:, 1], omega[:, 1]], dim=1
-        )
-        e = self.GetEnergy(state, params)
-        denom = e0.abs() + self.config.energy_eps
-        return torch.mean(((e - e0) / denom) ** 2)
+    def PhysicsEnergyLoss(self, feats, params, e0):
+        # Physics + Energy share the same forward // 동일 forward 재사용 (FP64)
+        with self._Float64Path():
+            f64 = feats.double()
+            p64 = params.double()
+            e0_64 = e0.double()
 
-    def PhysicsLoss(self, feats, params):
-        # EOM residual: d²θ/dt² - f(θ, ω, params) (design 3.1) // 물리 잔차
-        # design 4.6 (A): 잔차 경로 forward 전체 float64
-        ctx = self._Float64Path() if self.config.physics_float64 else _NullCtx()
-        with ctx:
-            f = feats.double() if self.config.physics_float64 else feats
-            p = params.double() if self.config.physics_float64 else params
-            theta, omega, accel = self.ThetaDerivs(f, create_graph=True)
+            theta, omega, accel = self.ThetaDerivs(f64)
+
+            # Physics residual
             f_eom = self.AngularAccel(
-                theta[:, 0], omega[:, 0], theta[:, 1], omega[:, 1], p
-            )                                              # (M, 2)
-            res = accel - f_eom
-            loss = torch.mean(res**2)
-        return loss.float()
+                theta[:, 0], omega[:, 0], theta[:, 1], omega[:, 1], p64
+            )
+            l_phys = torch.mean((accel - f_eom) ** 2)
+
+            # Energy residual (theta/omega 재사용)
+            state = torch.stack(
+                [theta[:, 0], omega[:, 0], theta[:, 1], omega[:, 1]], dim=1
+            )
+            e = self.GetEnergy(state, p64)
+            denom = e0_64.abs() + self.dataCfg.energy_eps
+            l_energy = torch.mean(((e - e0_64) / denom) ** 2)
+
+        return l_phys.float(), l_energy.float()
 
     def ICLoss(self, feats_ic, theta0_true):
-        # θ(t=0) = IC truth (design 4.3 L_ic) // 초기조건 손실
         theta = self(feats_ic)
         return torch.mean((theta - theta0_true) ** 2)
-
-    @contextlib.contextmanager
-    def _Float64Path(self):
-        # Full forward incl. weights in float64, restore after (design 4.6 fix)
-        # 가중치 포함 전체 경로 float64 → 복원 (메모리상 콜로케이션 배치 작게)
-        self.double()
-        try:
-            with torch.autocast(device_type=self.device_type, enabled=False):
-                yield
-        finally:
-            self.float()
+    
 
     def ComputeAllLosses(self, batch, colloc, ic):
-        # batch=(feats, θ_true, ω_true) ; colloc=(feats, params, e0) ; ic=(feats, θ0)
-        # 손실 항만 반환; λ 가중·정규화는 LambdaBalance, 합산은 학습 루프(미구현)
         l_data = self.DataLoss(*batch)
-        l_phys = self.PhysicsLoss(colloc[0], colloc[1])
-        l_energy = self.EnergyLoss(colloc[0], colloc[1], colloc[2])
-        l_ic = self.ICLoss(*ic)
+        l_phys, l_energy = self.PhysicsEnergyLoss(colloc[0], colloc[1], colloc[2])
+        l_ic = self.ICLoss(ic[0], ic[1])
         return {
             "data": l_data,
             "phys": l_phys,
@@ -89,10 +73,14 @@ class Loss:
             "ic": l_ic,
         }
 
+    @contextlib.contextmanager
+    def _Float64Path(self):
+        # Using FP64 in Calculate and return FP32 // FP64로 계산 후 FP32로 반환
+        self.double()
+        try:
+            with torch.autocast(device_type=self.device_type, enabled=False):
+                yield
+        finally:
+            self.float()
 
-class _NullCtx:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+# Dataloss 2차 미분 제거랑, FP64 path self.double() 구조 변경 먼저 해봐야함

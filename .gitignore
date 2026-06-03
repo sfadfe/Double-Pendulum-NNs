@@ -2,3 +2,10 @@
 .claude/
 __pycache__/
 data/
+request.txt
+model/
+CLAUDE.md
+double_pendulum_pinns_design.md
+offer.txt
+config.toml
+config_copy.toml

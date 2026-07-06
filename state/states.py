@@ -89,7 +89,7 @@ def GenerateStates(n, filename, IsFlip):
 n = 35000
 IsFlip = False
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).parent.parent
 
 if IsFlip:
     path = BASE_DIR / "data" / "hardstates.txt"

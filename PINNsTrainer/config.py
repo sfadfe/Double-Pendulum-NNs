@@ -9,36 +9,33 @@ class NetCfg:
     f_min: float = 0.2        # Hz, lowest oscillation // 최저 진동 주파수
     f_max: float = 48.0       # Hz, < Nyquist 50Hz // 샤프 과도성분 상한
 
-    in_params: int = 8 
+    in_params: int = 10   # 4 trig(θ0) + 2 ω(0) + 4 (m,L) // ω(0) IC 입력 포함
     width: int = 256          # hidden layer width // 은닉층 너비
     n: int = 4                # ResidualBlock count // 잔차 블록 수
-    out_dim: int = 2
+    out_dim: int = 4          # state output [θ1, θ2, ω1, ω2] // 상태공간 출력
 
     @property
     def gx_dim(self) -> int:
-        # Fourier(2L) + raw t_norm(1) + 8 // 임베딩 차원 = 57
+        # Fourier(2L) + raw t_norm(1) + in_params // 임베딩 차원 = 2L+1+in_params
         return 2 * self.fourier_l + 1 + self.in_params
 
 
 @dataclass
 class TrainCfg:
-    warmup_steps: int = 100           
+    warmup_steps: int = 100
     lambda_ic: float = 1.0
     lambda_data: float = 1.0
-    lambda_phys_init: float = 0.01    # sigmoid start // 시작값
-    lambda_phys_final: float = 1.0    # sigmoid end // 최종값
-    lambda_energy_init: float = 0.01
-    lambda_energy_final: float = 0.5
-    lambda_sigmoid_steps: int = 5000  # sigmoid transition span // sigmoid 전이 길이
-    lambda_sigmoid_mid: int = 2500    # sigmoid midpoint // sigmoid 중점
+    lambda_kin: float = 1.0
+    lambda_phys: float = 1.0
+    lambda_energy: float = 0.5
+    lambda_roll: float = 1.0      # rollout-aware (pushforward) 손실 base 가중치 // 윈도우 핸드오프 교정
+    lambda_min: float = 0.3       # ReLoBRaLo λ_relo clamp 하한 // B가 절대 스케일 담당, relo는 nudge만
+    lambda_max: float = 3.0       # ReLoBRaLo λ_relo clamp 상한
+    relobralo_tau: float = 0.1    # softmax temperature // 낮을수록 수렴 속도 차이에 민감
+    relobralo_alpha: float = 0.999  # EMA smoothing // 클수록 lambda 변화 느림
     lr: float = 1e-3
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    lbfgs_max_iter: int = 20
-    lbfgs_history: int = 50
-    lbfgs_batch: int = 8192    # L-BFGS 고정 미니배치 크기 // deterministic 손실
-    lbfgs_accum: int = 2       # collocation grad accumulation 스텝 수 // peak VRAM 절감
-
     replay_frac: float = 0.25
 
 @dataclass
@@ -50,19 +47,22 @@ class CollocCfg:
     ## VRAM 공간 남으면 20000에서 30000~50000으로 늘릴 가능성 고려.
     ## 실제 학습 시간은 FP64 연산에서 많이 소모됨. 늘려도 상관없음
 
-    lbfgs_n_colloc: int = 40000   # L-BFGS 단일구간 collocation 수 // accumulation step = 2 로 분할 처리
+    rar_top_frac: float = 0.2
+    rar_bot_frac: float = 0.2
+    rar_every: int = 1000
 
-    rar_top_frac: float = 0.2         
-    rar_bot_frac: float = 0.2         
-    rar_every: int = 1000             
+    ic_sigma: float = 0.0             # Phase 3: 물리 콜로케이션 IC 섭동 target (0=비활성)
+    ic_sigma_warmup: int = 200        # sigma 0→target 선형 램프 에폭 (Phase 2 진입 후)
 
 
 @dataclass
 class DataCfg:
     g: float = 9.81
 
-    t_data_max: float = 3.0 
+    t_data_max: float = 3.0
+    march_dt: float = 1.0     # time-marching window duration (s) // 플로우맵 윈도우 길이 — 네트워크가 보는 상대시간 τ∈[0,march_dt]
     energy_eps: float = 1e-3
+    phys_eps: float = 1.0     # EOM 상대잔차 분모 바닥값 // floor for relative physics residual denom (≈ small frac of typical |dω/dt|)
 
     nonflip_path: str = "data/nonflip_RK4_0_3s.npy"
     flip_path: str = "data/flip_RK4_0_3s.npy"
@@ -77,14 +77,11 @@ def LoadConfig(path):
     t   = raw["train"]
     n   = raw["net"]
     o   = raw["optimizer"]
-    s   = raw["scheduler"]
+    s   = raw.get("scheduler", {})   # val scheduler 제거 후 하위호환용 // min_lr 폴백 소스
     lam = raw["lambda"]
     c   = raw["colloc"]
     d   = raw["data"]
     os_ = raw.get("ode_scheduler", {})
-
-    total_opt_steps = t["max_epochs"] * c["seg_count"] * t["steps_per_segment"]
-    sig_mid = int(total_opt_steps * t["sigmoid_frac"])
 
     net_cfg = NetCfg(
         fourier_l=n["fourier_l"],
@@ -98,35 +95,36 @@ def LoadConfig(path):
         warmup_steps=o["warmup_steps"],
         lambda_ic=lam["ic"],
         lambda_data=lam["data"],
-        lambda_phys_init=lam["phys_init"],
-        lambda_phys_final=lam["phys_final"],
-        lambda_energy_init=lam["energy_init"],
-        lambda_energy_final=lam["energy_final"],
-        lambda_sigmoid_mid=sig_mid,
-        lambda_sigmoid_steps=sig_mid,
+        lambda_kin=lam.get("kin", 1.0),
+        lambda_phys=lam.get("phys", 1.0),
+        lambda_energy=lam.get("energy", 0.5),
+        lambda_roll=lam.get("roll", 1.0),
+        lambda_min=lam.get("lambda_min", 0.3),
+        lambda_max=lam.get("lambda_max", 3.0),
+        relobralo_tau=lam.get("relobralo_tau", 0.1),
+        relobralo_alpha=lam.get("relobralo_alpha", 0.999),
         lr=o["lr"],
         weight_decay=o["weight_decay"],
         grad_clip=o["grad_clip"],
-        lbfgs_max_iter=o["lbfgs_max_iter"],
-        lbfgs_history=o["lbfgs_history"],
-        lbfgs_batch=o.get("lbfgs_batch", 8192),
-        lbfgs_accum=o.get("lbfgs_accum", 2),
     )
 
     colloc_cfg = CollocCfg(
         seg_count=c["seg_count"],
         overlap_frac=c["overlap_frac"],
         n_colloc=c["n_colloc"],
-        lbfgs_n_colloc=c.get("lbfgs_n_colloc", 40000),
         rar_top_frac=c["rar_top_frac"],
         rar_bot_frac=c["rar_bot_frac"],
         rar_every=c["rar_every"],
+        ic_sigma=c.get("ic_sigma", 0.0),
+        ic_sigma_warmup=c.get("ic_sigma_warmup", 200),
     )
 
     data_cfg = DataCfg(
         g=d["g"],
         t_data_max=d["t_data_max"],
+        march_dt=d.get("march_dt", 1.0),   # 구 config 하위호환 // backward-compat for pre-marching configs
         energy_eps=d["energy_eps"],
+        phys_eps=d.get("phys_eps", 1.0),   # 구 config 하위호환 // backward-compat for configs predating relative phys loss
         batch_size=d["batch_size"],
         nonflip_path=d["nonflip_path"],
         scaler_name=d["scaler_name"],
@@ -137,8 +135,18 @@ def LoadConfig(path):
         "patience":           os_.get("patience",           80),
         "rel_tol":            os_.get("rel_tol",            0.005),
         "factor":             os_.get("factor",             0.8),
-        "min_lr":             s.get("min_lr",               1e-6),
+        "min_lr":             os_.get("min_lr", s.get("min_lr", 1e-6)),
         "activate_threshold": os_.get("activate_threshold", 500.0),
+        "rel_tol_decay":      os_.get("rel_tol_decay",      0.75),
+        "patience_decay":     os_.get("patience_decay",     1.0),   # LR 감쇄마다 patience에 곱할 비율 (1.0 = 비활성)
+        "min_patience":       os_.get("min_patience",       10),    # patience 하한 // 후반 노이즈 과민반응 방지
+        # Warm restart: 무개선 감쇄 연속 감지 시 LR 복원 // 기본값 = 비활성 (구 config 동작 불변)
+        "min_rel_tol":        os_.get("min_rel_tol",        0.0),   # rel_tol 하한 겸 감쇄 생산성 판정 기준
+        "max_bad_decays":     os_.get("max_bad_decays",     10**9), # 연속 무개선 감쇄 허용 횟수 (초과 시 restart)
+        "restart_lr0":        os_.get("restart_lr0",        0.0),   # 첫 restart 복원 LR (0 = restart 비활성)
+        "restart_decay":      os_.get("restart_decay",      0.5),   # restart마다 복원 LR에 곱할 비율 // SGDR 진폭 감쇄
+        "restart_cooldown":   os_.get("restart_cooldown",   30),    # restart 후 stall 동결 에폭
     }
 
-    return net_cfg, train_cfg, colloc_cfg, data_cfg, t, s, ode_s_params
+    return net_cfg, train_cfg, colloc_cfg, data_cfg, t, ode_s_params
+    

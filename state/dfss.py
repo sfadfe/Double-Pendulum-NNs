@@ -1,20 +1,23 @@
 import multiprocessing
 import os
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 from tqdm import tqdm
 
-import Double_pendulum as Dp
+import state.Double_pendulum as Dp
 
 IsFlip = False
 
 G = 9.81
 DT = 5e-06            # integration step, float64 (design 2.1) // 적분 스텝
-T_MAX = 3             # 0~3s only for now; 0~5 decided after t=3 results // 우선 0~3초만
+T_MAX = 5             # 0~5s: flow-map pivot, 윈도우 커버리지 확장 // time-marching 외삽 개선
 SAVE_INTERVAL = 2000  # 2000 step = 0.01s record // 0.01초 간격 기록
 ENERGY_TOL = 1e-4     # drop if |E(t)-E0|/|E0| exceeds (design 2.2/2.3) // 에너지 보존 필터
-FLIP_LIMIT = np.pi    # |theta| over pi within [0,3s] => flipped // 플립 판정 (연속 θ 기준)
+FLIP_LIMIT = np.pi    # |theta| over pi within [0,5s] => flipped // 플립 판정 (연속 θ 기준)
 
 
 def Energy(state, m1, m2, L1, L2):
@@ -58,7 +61,7 @@ def SimulateSingleTrajectory(args):
     e0 = Energy(dp.state, m1, m2, L1, L2)  # float64, conserved // 기준 총에너지
     trajectory = [GetDataRow(dp.state, m1, m2, L1, L2, 0.0)]
 
-    steps = int(T_MAX / DT)
+    steps = round(T_MAX / DT)   # int()는 부동소수점 절삭(5/5e-6=999999.99→999999)으로 끝점 누락 // round로 정확히 T_MAX 포함
     flipped = False
     for i in range(1, steps + 1):
         dp.RK4(DT)
@@ -85,17 +88,17 @@ def SimulateSingleTrajectory(args):
 
 
 if __name__ == "__main__":
-    BASE_DIR = Path(__file__).parent
+    BASE_DIR = Path(__file__).parent.parent
     output_dir = BASE_DIR / "data"
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     if IsFlip:
         input_path = output_dir / "hardstates.txt"
-        output_path = output_dir / "flip_RK4_0_3s.npy"
+        output_path = output_dir / "flip_RK4_0_5s.npy"
     else:
         input_path = output_dir / "states.txt"
-        output_path = output_dir / "nonflip_RK4_0_3s.npy"
+        output_path = output_dir / "nonflip_RK4_0_5s.npy"
 
     with open(input_path, "r") as f:
         lines = [line.strip() for line in f.readlines() if line.strip()]

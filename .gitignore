@@ -9,3 +9,10 @@ double_pendulum_pinns_design.md
 offer.txt
 config.toml
 config_copy.toml
+sweeps/
+double_pendulum_pinns.md
+Test/
+Sweep/
+.gitignore
+md/
+CLAUDE.md

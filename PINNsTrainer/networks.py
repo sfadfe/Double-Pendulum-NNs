@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 
 """
-- 입력: (N, 9) = [t, sin t1, cos t1, sin t2, cos t2, m1, m2, L1, L2]
-- t는 Fourier Features로 변환되어 주파수 공간으로 매핑됨, t는 또한 [0, t_data_max]에서 [-1, 1]로 정규화됨.
-- 각도 trig은 t=0 케이스 상수, m/L은 log z-score
+- 입력: (N, 11) = [τ, sin θ1, cos θ1, sin θ2, cos θ2, ω1, ω2, m1, m2, L1, L2]
+- time-marching flow map: τ는 윈도우 내 상대시간(τ∈[0, march_dt]), trig/ω는 윈도우 시작 상태(IC)
+- τ는 Fourier Features(물리 주파수, Hz)로 매핑되고, 또한 [0, march_dt]에서 [-1, 1]로 정규화됨
+- m/L은 log z-score
 """
 
 
@@ -33,10 +34,11 @@ class ResidualBlock(nn.Module):
         return (1.0 - z) * u + z * v + h  # U, V gating + residual connection
 
 
+
 class Networks(nn.Module):
     def __init__(self, netCfg, dataCfg):
         super().__init__()
-        self.t_data_max = dataCfg.t_data_max
+        self.march_dt = dataCfg.march_dt   # 상대시간 정규화 기준 // window duration for τ normalization
 
         self.fourier = FourierFeatures(netCfg.fourier_l, netCfg.f_min, netCfg.f_max)
 
@@ -49,7 +51,7 @@ class Networks(nn.Module):
         self.blocks = nn.ModuleList(
             [ResidualBlock(width) for i in range(netCfg.n)]
         )
-        self.out = nn.Linear(width, 2)
+        self.out = nn.Linear(width, 4)  # state-space output -  [θ1, θ2, ω1, ω2] // 상태공간형, [θ1, θ2, ω1, ω2] 직접 출력
 
         # Xavier init
         for m in self.modules():
@@ -59,10 +61,10 @@ class Networks(nn.Module):
 
     def forward(self, feats):
 
-        t = feats[:, 0:1]
-        emb_t = self.fourier(t)  # (N, 2L)
-        t_norm = 2.0 * t / self.t_data_max - 1.0
-        x = torch.cat([emb_t, t_norm, feats[:, 1:9]], dim=-1)  # (N, gx_dim)
+        tau = feats[:, 0:1]                              # relative time within window // 윈도우 내 상대시간
+        emb_t = self.fourier(tau)  # (N, 2L)
+        t_norm = 2.0 * tau / self.march_dt - 1.0
+        x = torch.cat([emb_t, t_norm, feats[:, 1:]], dim=-1)  # (N, gx_dim)
 
         u = self.proj_u(x)
         v = self.proj_v(x)
@@ -71,4 +73,5 @@ class Networks(nn.Module):
         for block in self.blocks:  # Pass all residual blocks through U and V gates. // 모든 residual block을 U, V 게이트에 통과시킴
             h = block(h, u, v)
 
-        return self.out(h)  # [th1, th2]
+        return self.out(h)  # (N, 4) [θ1, θ2, ω1, ω2]
+        

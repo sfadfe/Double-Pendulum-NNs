@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import torch
 
@@ -21,10 +22,63 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.g = data_cfg.g
         self.to(self.device)
 
+    def SetupFinetune(self, base_dir, run_dir, pretrain_dir, seed=42):
+        # Mixed data + replay buffer + frozen pretrain scaler // 파인튜닝 초기화
+        cfg = self.dataCfg
+        mixed_path = Path(cfg.data_path)
+        if not mixed_path.is_absolute():
+            mixed_path = Path(base_dir) / cfg.data_path
+        self.LoadMixedData(str(mixed_path))
+        if self.replay_n_case == 0:
+            raise RuntimeError(
+                "meta에 replay_idx가 없음 — state/dfss.py mixed로 재빌드하세요"
+            )
+
+        scaler_path = Path(pretrain_dir) / cfg.scaler_name
+        self.LoadScaler(str(scaler_path))
+        self.to(self.device)
+
+        self.data = self.data.to(self.device)
+        self.params_raw = self.params_raw.to(self.device)
+        if self.is_flip is not None:
+            self.is_flip = self.is_flip.to(self.device)
+        if self.replay_idx is not None:
+            self.replay_idx = self.replay_idx.to(self.device)
+
+        self.t_grid = self.t_grid.to(self.device)
+        self.dt = float(self.t_grid[1] - self.t_grid[0])
+        t_min = float(self.t_grid[0])
+        t_max = float(self.t_grid[-1])
+        self.BuildSegments(t_min, t_max)
+        self.InitLambda()
+        self.SetOptimizerAdamW()
+        self.best_metric = float("inf")
+        self.best_ode_metric = float("inf")
+        self.best_extrap_metric = float("inf")
+        self._replay_active = False
+        self._colloc_inited = False
+        return self.n_case
+
+    def LoadWeights(self, path):
+        # Pretrain weights only; optimizer/scheduler fresh start // 가중치만 이어받기
+        ckpt = torch.load(path, map_location=self.device)
+        self.load_state_dict(ckpt["model_state"])
+        saved_gs = {k: v for k, v in ckpt.get("grad_scale", {}).items() if k != "roll"}
+        self.grad_scale = {**self.grad_scale, **saved_gs}
+        self.roll_ramp = ckpt.get("roll_ramp", self.roll_ramp)
+        self._phys_balanced = ckpt.get("phys_balanced", self._phys_balanced)
+        return ckpt.get("step", 0)
+
     def Setup(self, base_dir, run_dir=None):
         cfg = self.dataCfg
         self.LoadData(os.path.join(base_dir, cfg.nonflip_path))
-        self.ComputeScaler(run_dir if run_dir is not None else base_dir)
+        extra_omega = []
+        if cfg.scaler_extra_omega:
+            p = Path(cfg.scaler_extra_omega)
+            extra_omega.append(str(p if p.is_absolute() else Path(base_dir) / p))
+        self.ComputeScaler(
+            run_dir if run_dir is not None else base_dir, extra_omega_paths=extra_omega
+        )
         self.to(self.device)
         self.data = self.data.to(self.device)
         self.params_raw = self.params_raw.to(self.device)

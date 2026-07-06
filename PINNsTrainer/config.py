@@ -5,19 +5,25 @@ from pathlib import Path
 
 @dataclass
 class NetCfg:
-    fourier_l: int = 24       # number of frequencies L // 주파수 개수
+    fourier_l: int = 32       # number of frequencies L // 주파수 개수
     f_min: float = 0.2        # Hz, lowest oscillation // 최저 진동 주파수
-    f_max: float = 48.0       # Hz, < Nyquist 50Hz // 샤프 과도성분 상한
+    f_max: float = 56.0       # Hz, < Nyquist 50Hz // 샤프 과도성분 상한
 
-    in_params: int = 10   # 4 trig(θ0) + 2 ω(0) + 4 (m,L) // ω(0) IC 입력 포함
-    width: int = 256          # hidden layer width // 은닉층 너비
-    n: int = 4                # ResidualBlock count // 잔차 블록 수
-    out_dim: int = 4          # state output [θ1, θ2, ω1, ω2] // 상태공간 출력
+    ic_feat_dim: int = 6      # 4 trig(θ0) + 2 ω(0) // raw m/L 제외 (ParamEmbed로 대체)
+    param_embed_dim: int = 32 # ParamEmbed 출력 차원 // option B3
+    width: int = 384          # hidden layer width // 은닉층 너비 (M tier)
+    n: int = 6                # ResidualBlock count // 잔차 블록 수
+    out_dim: int = 4          # state output [Δθ1, Δθ2, ω1, ω2] // 상태공간 출력
+
+    @property
+    def feat_dim(self) -> int:
+        # τ(1) + IC(6) + param_embed // Dataset._BuildFeats 출력 폭
+        return 1 + self.ic_feat_dim + self.param_embed_dim
 
     @property
     def gx_dim(self) -> int:
-        # Fourier(2L) + raw t_norm(1) + in_params // 임베딩 차원 = 2L+1+in_params
-        return 2 * self.fourier_l + 1 + self.in_params
+        # Fourier(2L) + t_norm(1) + IC(6) + param_embed // trunk 입력 차원
+        return 2 * self.fourier_l + 1 + self.ic_feat_dim + self.param_embed_dim
 
 
 @dataclass
@@ -37,6 +43,7 @@ class TrainCfg:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     replay_frac: float = 0.25
+    n_colloc_cases: int = 0       # finetune RAR 풀 크기 (0 → max_cases)
 
 @dataclass
 class CollocCfg:
@@ -50,6 +57,8 @@ class CollocCfg:
     rar_top_frac: float = 0.2
     rar_bot_frac: float = 0.2
     rar_every: int = 1000
+    rar_jitter_frac: float = 0.08   # τ jitter = ± frac * march_dt
+    colloc_flip_bias: float = 0.0   # finetune: flip case 하한 비율 (0=uniform)
 
     ic_sigma: float = 0.0             # Phase 3: 물리 콜로케이션 IC 섭동 target (0=비활성)
     ic_sigma_warmup: int = 200        # sigma 0→target 선형 램프 에폭 (Phase 2 진입 후)
@@ -66,7 +75,10 @@ class DataCfg:
 
     nonflip_path: str = "data/nonflip_RK4_0_3s.npy"
     flip_path: str = "data/flip_RK4_0_3s.npy"
+    data_path: str = ""           # finetune mixed dataset (empty → nonflip_path)
+    replay_path: str = ""         # finetune replay buffer (empty → nonflip_path)
     scaler_name: str = "scaler.npy"
+    scaler_extra_omega: str = ""  # pretrain scaler ω RMS에 포함할 추가 궤적(예: mixed) — flip OOD 방지
     batch_size: int = 8192
 
 
@@ -89,6 +101,7 @@ def LoadConfig(path):
         f_max=n["f_max"],
         width=n["width"],
         n=n["n_blocks"],
+        param_embed_dim=n.get("param_embed_dim", 32),
     )
 
     train_cfg = TrainCfg(
@@ -106,6 +119,8 @@ def LoadConfig(path):
         lr=o["lr"],
         weight_decay=o["weight_decay"],
         grad_clip=o["grad_clip"],
+        replay_frac=t.get("replay_frac", 0.25),
+        n_colloc_cases=t.get("n_colloc_cases", c.get("n_colloc_cases", 0)),
     )
 
     colloc_cfg = CollocCfg(
@@ -115,6 +130,8 @@ def LoadConfig(path):
         rar_top_frac=c["rar_top_frac"],
         rar_bot_frac=c["rar_bot_frac"],
         rar_every=c["rar_every"],
+        rar_jitter_frac=c.get("rar_jitter_frac", 0.08),
+        colloc_flip_bias=c.get("colloc_flip_bias", 0.0),
         ic_sigma=c.get("ic_sigma", 0.0),
         ic_sigma_warmup=c.get("ic_sigma_warmup", 200),
     )
@@ -127,7 +144,10 @@ def LoadConfig(path):
         phys_eps=d.get("phys_eps", 1.0),   # 구 config 하위호환 // backward-compat for configs predating relative phys loss
         batch_size=d["batch_size"],
         nonflip_path=d["nonflip_path"],
+        data_path=d.get("data_path", d["nonflip_path"]),
+        replay_path=d.get("replay_path", d.get("nonflip_path", d["nonflip_path"])),
         scaler_name=d["scaler_name"],
+        scaler_extra_omega=d.get("scaler_extra_omega", ""),
     )
 
     ode_s_params = {

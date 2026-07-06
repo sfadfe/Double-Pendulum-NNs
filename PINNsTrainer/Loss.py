@@ -3,8 +3,9 @@ import torch.func as tf
 
 class Loss:
     def StateDerivs(self, feats):
-        # net outputs state [θ, ω]; one forward-mode pass gives [dθ/dt, dω/dt]
-        # feats: (M, 11) ; col 0 = t(seconds), col 1: = case-constant
+        # net outputs [Δθ, ω]; one forward-mode pass gives [dΔθ/dt, dω/dt]
+        # dΔθ/dt = dθ/dt since θ_IC is constant → kin residual (dΔθ/dt = ω) unchanged
+        # feats: (M, feat_dim) ; col 0 = τ, col 1: = case-constant (IC + param_embed)
         # FP32 jvp: network params are FP32 anyway — no precision gain from FP64 functional_call
         # // FP32 jvp로 FP32 코어 활용 (검증: domega/dt floor 1.8e-5 << 잔차 O(100)). AngularAccel/GetEnergy만 FP64 유지
         t = feats[:, 0:1].float()
@@ -27,32 +28,22 @@ class Loss:
             (omega - omega_true) ** 2
         )
 
-    def PhysicsEnergyLoss(self, feats, params, e0):
-        # FP32 jvp for network derivatives (검증: loss rel_diff < 4e-6) // FP32로 dθ/dt, dω/dt — FP32 코어 활용
+    def _PhysicsEnergySlice(self, feats, params, e0, ic_theta):
+        # Single colloc slice // 콜로케이션 청크 1개분 물리+에너지 손실
         theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
-
-        # Kinematic residual: dθ/dt = ω // 출력 ω와 θ의 시간미분 일치
         l_kin = torch.mean((dtheta_dt - omega) ** 2)
 
-        # EOM + Energy stay FP64 — formula cancellation guard // 수식 상쇄 보호: AngularAccel/GetEnergy만 FP64
-        # grad는 .double() 캐스트를 타고 FP32 망 파라미터로 환원. 수식 backward만 FP64(작음), 망 backward는 FP32
-        # detach 금지: phys의 f_eom·energy의 state는 망 출력 theta/omega가 유일한 grad 경로 (끊으면 energy grad 소멸)
         with torch.autocast(device_type=self.device_type, enabled=False):
             p64 = params.double()
             e0_64 = e0.double()
-            th64 = theta.double()
+            th64 = ic_theta.double() + theta.double()
             om64 = omega.double()
             dom64 = domega_dt.double()
-
-            # EOM residual: dω/dt = AngularAccel(θ, ω) // 운동방정식 잔차
             f_eom = self.AngularAccel(
                 th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1], p64
             )
-            # Per-sample relative residual: each point normalized by its own EOM scale // 샘플별 가속도 스케일로 무차원화: 저가속/고가속 구간 동등 비중
             denom = f_eom.abs() + self.dataCfg.phys_eps
             l_phys = torch.mean(((dom64 - f_eom) / denom) ** 2).float()
-
-            # Energy residual (theta/omega 재사용)
             state = torch.stack(
                 [th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1]], dim=1
             )
@@ -62,13 +53,41 @@ class Loss:
 
         return l_kin, l_phys, l_energy
 
-    def ICLoss(self, feats_ic, theta0_true, omega0_true):
-        # τ=0 must reproduce the window-start state (θ and ω) // 윈도우 연속성: 시작 상태 전체 일치
+    def PhysicsEnergyLoss(self, feats, params, e0, ic_theta):
+        l_kin, l_phys, l_energy = self._PhysicsEnergySlice(feats, params, e0, ic_theta)
+        return l_kin, l_phys, l_energy
+
+    @torch.no_grad()
+    def PhysicsResidualPerPoint(self, feats, params, e0, ic_theta):
+        # Per-sample physics residual for RAR ranking // RAR 점선택용 샘플별 잔차 (energy 제외)
+        theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
+
+        kin_err = dtheta_dt - omega
+        l_kin = torch.mean(kin_err.pow(2), dim=1)
+
+        with torch.autocast(device_type=self.device_type, enabled=False):
+            p64 = params.double()
+            th64 = ic_theta.double() + theta.double()
+            om64 = omega.double()
+            dom64 = domega_dt.double()
+            f_eom = self.AngularAccel(
+                th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1], p64
+            )
+            denom = f_eom.abs() + self.dataCfg.phys_eps
+            l_phys = torch.mean(((dom64 - f_eom) / denom).pow(2), dim=1).float()
+
+        return torch.sqrt(l_kin + l_phys)
+
+    def _ICLossSlice(self, feats_ic, theta0_true, omega0_true):
+        # τ=0 window-start match on a slice // IC 손실 청크
         out = self(feats_ic)
         theta, omega = out[:, :2], out[:, 2:]
         return torch.mean((theta - theta0_true) ** 2) + torch.mean(
             (omega - omega0_true) ** 2
         )
+
+    def ICLoss(self, feats_ic, theta0_true, omega0_true):
+        return self._ICLossSlice(feats_ic, theta0_true, omega0_true)
 
     def RolloutLoss(self, case_idx, depth, n_points):
         # Pushforward (Brandstetter+ 2022): roll `depth` windows under no_grad to reach the
@@ -86,14 +105,26 @@ class Loss:
 
         # true IC at window k0 start // 참 시작 상태
         i0 = int(round(k0 * md / dt))
-        state = self.data[case_idx, i0][:, [1, 2, 3, 4]]
+        data, _ = self._ActiveSource()
+        if data.device != self.device:
+            ci = case_idx.cpu()
+        else:
+            ci = case_idx
+        state = data[ci, i0][:, [1, 2, 3, 4]]
+        if state.device != self.device:
+            state = state.to(self.device)
+        params = self._ParamsAt(case_idx)
 
-        # pushforward: only the end state is needed to hand off // 끝상태만 다음 IC로 전달
+        # pushforward: net outputs Δθ; absolute θ_next = θ_start + Δθ_end // 감김수 누적 핸드오프
         tau_end = torch.full((1, 1), md, device=dev)
         with torch.no_grad():
             for _ in range(depth):
-                out = self._RollWindow(case_idx, state, tau_end)   # (n,1,4)
-                state = self._NextIC(out[:, -1, :])
+                out = self._RollWindow(case_idx, params, state, tau_end)   # (n,1,4) [Δθ,ω]
+                last = out[:, -1, :]
+                th_abs = state[:, [0, 2]] + last[:, :2]                    # 절대각 복원
+                state = torch.stack(
+                    [th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1
+                )
         state = state.detach()                                     # fixed off-manifold input
 
         # differentiable window kg, matched to stored trajectory // grad 윈도우 = 참 데이터 매칭
@@ -106,17 +137,24 @@ class Loss:
             grid = grid[sel]
         tau = (self.t_grid[grid] - self.t_grid[i_start]).reshape(-1, 1).float()
 
-        out = self._RollWindow(case_idx, state, tau)               # (n,P,4) with grad
-        seg = self.data[case_idx][:, grid]                         # (n,P,13)
+        out = self._RollWindow(case_idx, params, state, tau)       # (n,P,4) [Δθ,ω] with grad
+        theta_pred = state[:, [0, 2]].unsqueeze(1) + out[:, :, :2]  # 절대각 = 윈도우 시작각 + Δθ
+        omega_pred = out[:, :, 2:]
+        grid_idx = grid.cpu() if data.device != self.device else grid
+        seg = data[ci][:, grid_idx]
+        if seg.device != self.device:
+            seg = seg.to(self.device)
         theta_true = seg[:, :, [1, 3]]
         omega_true = seg[:, :, [2, 4]]
-        return torch.mean((out[:, :, :2] - theta_true) ** 2) + torch.mean(
-            (out[:, :, 2:] - omega_true) ** 2
+        return torch.mean((theta_pred - theta_true) ** 2) + torch.mean(
+            (omega_pred - omega_true) ** 2
         )
 
     def ComputeAllLosses(self, batch, colloc, ic):
         l_data = self.DataLoss(*batch)
-        l_kin, l_phys, l_energy = self.PhysicsEnergyLoss(colloc[0], colloc[1], colloc[2])
+        l_kin, l_phys, l_energy = self.PhysicsEnergyLoss(
+            colloc[0], colloc[1], colloc[2], colloc[3]
+        )
         l_ic = self.ICLoss(ic[0], ic[1], ic[2])
         return {
             "data": l_data,

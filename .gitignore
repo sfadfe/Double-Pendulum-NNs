@@ -16,3 +16,4 @@ Sweep/
 .gitignore
 md/
 CLAUDE.md
+.cursor/    

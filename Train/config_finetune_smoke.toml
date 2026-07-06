@@ -1,0 +1,70 @@
+[train]
+max_epochs        = 1
+steps_per_segment = 2
+max_cases         = 40
+n_val             = 30
+n_colloc_cases    = 40
+replay_frac       = 1.0
+save_interval_sec = 99999
+warmup_epochs     = 0
+use_grad_balance  = false
+val_interval      = 999
+rollout_interval  = 999
+rollout_cases     = 20
+extrap_cases      = 0
+save_rollout_best = false
+roll_cases        = 0
+
+[net]
+fourier_l = 32
+f_min     = 0.2
+f_max     = 56.0
+width     = 384
+n_blocks  = 6
+param_embed_dim = 32
+
+[optimizer]
+lr            = 5e-5
+weight_decay  = 1e-4
+grad_clip     = 1.0
+warmup_steps  = 50
+
+[ode_scheduler]
+ema_beta           = 0.92
+patience           = 60
+rel_tol            = 0.2
+factor             = 0.85
+min_lr             = 1e-6
+activate_threshold = 0.15
+
+[lambda]
+ic      = 1.0
+data    = 1.0
+kin     = 1.0
+phys    = 1.0
+energy  = 0.8
+roll    = 0.0
+
+[colloc]
+seg_count         = 3
+overlap_frac      = 0.15
+n_colloc          = 2000
+n_colloc_cases    = 40
+rar_top_frac      = 0.2
+rar_bot_frac      = 0.2
+rar_every         = 4
+rar_jitter_frac   = 0.08
+colloc_flip_bias  = 0.5
+ic_sigma          = 0.0
+ic_sigma_warmup   = 1
+
+[data]
+g            = 9.81
+t_data_max   = 5.0
+march_dt     = 1.0
+energy_eps   = 1e-3
+phys_eps     = 1.0
+batch_size   = 512
+nonflip_path = "data/nonflip_RK4_0_5s.npy"
+data_path    = "data/mixed_smoke.npy"
+scaler_name  = "scaler.npy"

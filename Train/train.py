@@ -1,10 +1,10 @@
-#phase 1 vram 1.6gb, phase2 vram 2.3gb ->1.7gb
+#phase 1 vram peak 1.6gb, phase2 vram 2.3gb ->1.7gb
 
 
 import argparse
 import shutil
 from pathlib import Path
-import sys
+import sys  
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -30,7 +30,7 @@ def Train(MainFolderPath):
     shutil.copy(cfg_path, MainFolderPath / "config.toml")
 
     torch.set_float32_matmul_precision("high")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"     
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
     trainer.Setup(base_dir, MainFolderPath)

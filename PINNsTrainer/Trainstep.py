@@ -8,6 +8,8 @@ class LambdaBalance:
         c = self.trainCfg
         self.grad_scale = {"data": 1.0, "kin": 1.0, "phys": 1.0, "energy": 1.0, "ic": 1.0}
         self.roll_ramp = 1.0               # rollout 손실 0→1 램프 계수 (grad_scale 슬롯 재활용 폐기 → 명시 분리) // explicit ramp
+        self.phys_ramp = 0.0               # Phase 2 kin/phys/energy backward sigmoid ramp // loop에서 갱신
+        self._lr_drop_done = False         # [train] lr_drop_epoch 1회 하향 완료 // OdeScheduler와 별개
         self._phys_balanced = False        # Phase 2 진입 시 첫 RebalanceGradScales로 True
         self._colloc_ic_sigma = 0.0        # 물리 콜로케이션 IC 섭동 폭 (Phase 3, 매 에폭 램프) // off-manifold
         self._base_lambda = {
@@ -33,6 +35,10 @@ class LambdaBalance:
     def _LossChunk(self):
         return self.dataCfg.batch_size
 
+    def _PhysRamp(self):
+        # kin/phys/energy backward scale (Phase 1 → 0) // training loop sets self.phys_ramp
+        return self.phys_ramp
+
     def _GradNormOfLoss(self, loss):
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward(retain_graph=False)
@@ -54,11 +60,12 @@ class LambdaBalance:
             lk, lp, le = self._PhysicsEnergySlice(
                 feats, meta["params"][sl], meta["e0"][sl], ic_theta
             )
+            pr = self._PhysRamp()
             combo = (
                 lam["kin"] * self.grad_scale["kin"] * lk
                 + lam["phys"] * self.grad_scale["phys"] * lp
                 + lam["energy"] * self.grad_scale["energy"] * le
-            ) * ((e - s) / n)
+            ) * pr * ((e - s) / n)
             combo.backward(retain_graph=False)
             kin_acc += float(lk.detach()) * ((e - s) / n)
             phys_acc += float(lp.detach()) * ((e - s) / n)

@@ -30,6 +30,7 @@ grad_clip     = 1.0
 warmup_steps  = 50
 
 [ode_scheduler]
+always_active      = true
 ema_beta           = 0.92
 patience           = 60
 rel_tol            = 0.2
@@ -62,7 +63,7 @@ ic_sigma_warmup   = 1
 g            = 9.81
 t_data_max   = 5.0
 march_dt     = 1.0
-energy_eps   = 1e-3
+energy_eps   = 0.01
 phys_eps     = 1.0
 batch_size   = 512
 nonflip_path = "data/nonflip_RK4_0_5s.npy"

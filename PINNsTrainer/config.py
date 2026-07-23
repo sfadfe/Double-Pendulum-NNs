@@ -44,6 +44,11 @@ class TrainCfg:
     grad_clip: float = 1.0
     replay_frac: float = 0.25
     n_colloc_cases: int = 0       # finetune RAR 풀 크기 (0 → max_cases)
+    phys_ramp_epochs: int = 60    # sigmoid ramp 참고 길이 (문서·로그) // reference span
+    phys_ramp_center: int = 30    # e2 = epoch - warmup_epochs 기준 중심
+    phys_ramp_width: int = 10     # sigmoid 폭 // ramp steepness
+    lr_drop_epoch: int = 0        # 고정 LR 1회 하향 에폭 (0=비활성) // OdeScheduler와 별개
+    lr_drop_to: float = 0.0       # lr_drop_epoch부터 적용할 LR 상한 // min(cur, lr_drop_to)
 
 @dataclass
 class CollocCfg:
@@ -70,7 +75,7 @@ class DataCfg:
 
     t_data_max: float = 3.0
     march_dt: float = 1.0     # time-marching window duration (s) // 플로우맵 윈도우 길이 — 네트워크가 보는 상대시간 τ∈[0,march_dt]
-    energy_eps: float = 1e-3
+    energy_eps: float = 0.01  # energy 상대잔차 분모 바닥값 // floor when |E0|≈|E|≈0 (symmetric denom)
     phys_eps: float = 1.0     # EOM 상대잔차 분모 바닥값 // floor for relative physics residual denom (≈ small frac of typical |dω/dt|)
 
     nonflip_path: str = "data/nonflip_RK4_0_3s.npy"
@@ -121,6 +126,11 @@ def LoadConfig(path):
         grad_clip=o["grad_clip"],
         replay_frac=t.get("replay_frac", 0.25),
         n_colloc_cases=t.get("n_colloc_cases", c.get("n_colloc_cases", 0)),
+        phys_ramp_epochs=t.get("phys_ramp_epochs", 60),
+        phys_ramp_center=t.get("phys_ramp_center", 30),
+        phys_ramp_width=t.get("phys_ramp_width", 10),
+        lr_drop_epoch=t.get("lr_drop_epoch", 0),
+        lr_drop_to=t.get("lr_drop_to", 0.0),
     )
 
     colloc_cfg = CollocCfg(
@@ -156,16 +166,13 @@ def LoadConfig(path):
         "rel_tol":            os_.get("rel_tol",            0.005),
         "factor":             os_.get("factor",             0.8),
         "min_lr":             os_.get("min_lr", s.get("min_lr", 1e-6)),
+        "always_active":        os_.get("always_active",        True),
         "activate_threshold": os_.get("activate_threshold", 500.0),
         "rel_tol_decay":      os_.get("rel_tol_decay",      0.75),
         "patience_decay":     os_.get("patience_decay",     1.0),   # LR 감쇄마다 patience에 곱할 비율 (1.0 = 비활성)
         "min_patience":       os_.get("min_patience",       10),    # patience 하한 // 후반 노이즈 과민반응 방지
-        # Warm restart: 무개선 감쇄 연속 감지 시 LR 복원 // 기본값 = 비활성 (구 config 동작 불변)
-        "min_rel_tol":        os_.get("min_rel_tol",        0.0),   # rel_tol 하한 겸 감쇄 생산성 판정 기준
-        "max_bad_decays":     os_.get("max_bad_decays",     10**9), # 연속 무개선 감쇄 허용 횟수 (초과 시 restart)
-        "restart_lr0":        os_.get("restart_lr0",        0.0),   # 첫 restart 복원 LR (0 = restart 비활성)
-        "restart_decay":      os_.get("restart_decay",      0.5),   # restart마다 복원 LR에 곱할 비율 // SGDR 진폭 감쇄
-        "restart_cooldown":   os_.get("restart_cooldown",   30),    # restart 후 stall 동결 에폭
+        "min_rel_tol":        os_.get("min_rel_tol",        0.0),   # rel_tol 하한
+        "phase2_lr":          os_.get("phase2_lr",          0.0),   # Phase 2 진입 1회 LR (0 = 비활성)
     }
 
     return net_cfg, train_cfg, colloc_cfg, data_cfg, t, ode_s_params

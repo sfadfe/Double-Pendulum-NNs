@@ -17,6 +17,7 @@ CSV_HEADER = [
     "Lambda_ODE", "Lambda_Energy",
     "ExtrapBest", "ExtrapOmega",
     "AvgLoss_Roll", "Lambda_Roll",
+    "PhysRamp",
 ]
 
 
@@ -231,6 +232,26 @@ def WriteLog(log_path, log_rows):
             writer.writerow(row)
 
 
+def ApplyLrDrop(trainer, epoch, drop_epoch, drop_to):
+    # OdeScheduler와 별개 — 지정 에폭에 LR 1회 하향 // fixed epoch LR cap
+    if drop_epoch <= 0 or drop_to <= 0.0:
+        return
+    if epoch < drop_epoch:
+        return
+    cur_lr = trainer.optimizer.param_groups[0]["lr"]
+    if cur_lr <= drop_to:
+        trainer._lr_drop_done = True
+        return
+    for pg in trainer.optimizer.param_groups:
+        pg["lr"] = drop_to
+    if not trainer._lr_drop_done:
+        tqdm.write(
+            f"[lr_drop] epoch {epoch}  lr {cur_lr:.2e} -> {drop_to:.2e}"
+            f"  (OdeScheduler independent)"
+        )
+    trainer._lr_drop_done = True
+
+
 class PretrainHooks:
     # Default pretrain: LHS collocation + train_pool shuffle // 파인튜닝은 서브클래스로 교체
 
@@ -338,6 +359,11 @@ def RunTrainLoop(
     ROLL_POINTS = t_params.get("roll_points", 12)
     roll_enabled = ROLL_CASES > 0 and trainer.trainCfg.lambda_roll > 0
 
+    PHYS_RAMP_CENTER = train_cfg.phys_ramp_center
+    PHYS_RAMP_WIDTH = max(train_cfg.phys_ramp_width, 1)
+    LR_DROP_EPOCH = train_cfg.lr_drop_epoch
+    LR_DROP_TO = train_cfg.lr_drop_to
+
     if ROLL_ACTIVATE_EPOCH is not None and roll_enabled:
         tqdm.write(f"[roll] fixed activate at epoch {int(ROLL_ACTIVATE_EPOCH)} (scheduler gate bypassed)")
 
@@ -358,6 +384,10 @@ def RunTrainLoop(
     ode_sched = ode_sched_cls(trainer.optimizer, ode_s_params, ode_ema_init)
     if ode_sched_state is not None:
         ode_sched.LoadStateDict(ode_sched_state)
+    if start_epoch > DATA_WARMUP_EPOCHS:
+        ode_sched.phase2_dropped = True
+    if start_epoch >= LR_DROP_EPOCH and LR_DROP_EPOCH > 0:
+        trainer._lr_drop_done = True
 
     pbar = tqdm(range(start_epoch, t_params["max_epochs"]), desc="Training", dynamic_ncols=True)
 
@@ -382,16 +412,28 @@ def RunTrainLoop(
                 trainer.roll_ramp = min(1.0, (epoch - roll_anchor + 1) / max(ROLL_RAMP, 1))
 
             hooks.OnEpochStart(trainer, epoch, phase1, ode_sched, t_params)
+            if epoch == DATA_WARMUP_EPOCHS:
+                ode_sched.DropOnPhase2(epoch)
+            ApplyLrDrop(trainer, epoch, LR_DROP_EPOCH, LR_DROP_TO)
             # replay 에폭 여부를 에폭 시작 시점에 확정 // val/rollout이 _replay_active를 리셋하기 전 캡처
             replay_epoch = getattr(trainer, "_replay_active", False)
 
+            e2 = 0
             if not phase1:
                 e2 = epoch - DATA_WARMUP_EPOCHS
                 warm = max(trainer.collocCfg.ic_sigma_warmup, 1)
                 trainer._colloc_ic_sigma = trainer.collocCfg.ic_sigma * min(1.0, e2 / warm)
+                if e2 >= 0:
+                    x = (e2 - PHYS_RAMP_CENTER) / PHYS_RAMP_WIDTH
+                    trainer.phys_ramp = 1.0 / (1.0 + math.exp(-x))
+                else:
+                    trainer.phys_ramp = 0.0
+            else:
+                trainer.phys_ramp = 0.0
 
             if (USE_GRAD_BALANCE and not phase1 and not replay_epoch
-                    and ((epoch - DATA_WARMUP_EPOCHS) % GRAD_BALANCE_EVERY == 0)):
+                    and trainer.phys_ramp >= 0.5
+                    and (e2 % GRAD_BALANCE_EVERY == 0)):
                 g = trainer.RebalanceGradScales(GRAD_BALANCE_BATCHES)
                 gs = trainer.grad_scale
                 tqdm.write(
@@ -467,7 +509,8 @@ def RunTrainLoop(
 
             # replay 에폭(쉬운 nonflip)은 적응 장치에서 격리 // 분포 스위칭이 λ·LR 스케줄을 오염시키지 않도록
             if not phase1 and epoch_steps > 0 and not replay_epoch:
-                trainer.UpdateReLoBRaLo(avg)
+                if trainer.phys_ramp >= 1.0:
+                    trainer.UpdateReLoBRaLo(avg)
                 ode_sched.Step(avg["phys"], epoch)
 
             rollout_loss = float("nan")
@@ -518,6 +561,7 @@ def RunTrainLoop(
                 "ExtrapOmega":    extrap_omega_loss,
                 "AvgLoss_Roll":   avg["roll"],
                 "Lambda_Roll":    lam["roll"] * trainer.roll_ramp if roll_on else float("nan"),
+                "PhysRamp":       trainer.phys_ramp if not phase1 else float("nan"),
             })
             WriteLog(log_path, log_rows)
 

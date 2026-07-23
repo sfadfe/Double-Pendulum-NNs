@@ -70,10 +70,10 @@ class Networks(nn.Module):
         self.head_theta = nn.Linear(width, 2)   # Δθ1, Δθ2 // option B1
         self.head_omega = nn.Linear(width, 2)   # ω1, ω2
 
-        # Xavier init
+        # Kaiming init for SiLU // Tanh용 Xavier 대신 ReLU-family 휴리스틱
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 nn.init.zeros_(m.bias)
 
     def forward(self, feats):

@@ -48,7 +48,8 @@ class Loss:
                 [th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1]], dim=1
             )
             e = self.GetEnergy(state, p64)
-            denom_e = e0_64.abs() + self.dataCfg.energy_eps
+            # max(|E0|,|E|) scale: E0≈0 zero-crossing 시 |E0|만 분모로 쓰면 폭발 // symmetric energy scale
+            denom_e = torch.maximum(e0_64.abs(), e.abs()) + self.dataCfg.energy_eps
             l_energy = torch.mean(((e - e0_64) / denom_e) ** 2).float()
 
         return l_kin, l_phys, l_energy
@@ -59,11 +60,8 @@ class Loss:
 
     @torch.no_grad()
     def PhysicsResidualPerPoint(self, feats, params, e0, ic_theta):
-        # Per-sample physics residual for RAR ranking // RAR 점선택용 샘플별 잔차 (energy 제외)
+        # Per-sample ODE relative residual for RAR ranking // kin(절대) 제외 — ω 큰 점 편향 방지
         theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
-
-        kin_err = dtheta_dt - omega
-        l_kin = torch.mean(kin_err.pow(2), dim=1)
 
         with torch.autocast(device_type=self.device_type, enabled=False):
             p64 = params.double()
@@ -76,7 +74,7 @@ class Loss:
             denom = f_eom.abs() + self.dataCfg.phys_eps
             l_phys = torch.mean(((dom64 - f_eom) / denom).pow(2), dim=1).float()
 
-        return torch.sqrt(l_kin + l_phys)
+        return torch.sqrt(l_phys)
 
     def _ICLossSlice(self, feats_ic, theta0_true, omega0_true):
         # τ=0 window-start match on a slice // IC 손실 청크

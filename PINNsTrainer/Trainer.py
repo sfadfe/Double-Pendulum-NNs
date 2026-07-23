@@ -66,6 +66,8 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         saved_gs = {k: v for k, v in ckpt.get("grad_scale", {}).items() if k != "roll"}
         self.grad_scale = {**self.grad_scale, **saved_gs}
         self.roll_ramp = ckpt.get("roll_ramp", self.roll_ramp)
+        self.phys_ramp = ckpt.get("phys_ramp", self.phys_ramp)
+        self._lr_drop_done = ckpt.get("lr_drop_done", self._lr_drop_done)
         self._phys_balanced = ckpt.get("phys_balanced", self._phys_balanced)
         return ckpt.get("step", 0)
 
@@ -121,6 +123,8 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
                 "optimizer_state": self.optimizer.state_dict(),
                 "grad_scale": self.grad_scale,        # B 균등화 스케일 // 10에폭마다 EMA 갱신 → resume 복원 필수
                 "roll_ramp": self.roll_ramp,          # rollout 0→1 램프 계수 // resume 시 램프 위치 복원
+                "phys_ramp": self.phys_ramp,          # physics sigmoid ramp // resume 시 ramp 위치 복원
+                "lr_drop_done": self._lr_drop_done,   # 고정 LR drop 1회 완료 // resume 시 중복 로그 방지
                 "phys_balanced": self._phys_balanced, # Phase 2 진입(첫 B 호출) 여부
                 "sched_state": sched_state,  # OdeScheduler 내부 상태 // scheduler resume 복원용
             },
@@ -166,5 +170,7 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         saved_gs = {k: v for k, v in ckpt.get("grad_scale", {}).items() if k != "roll"}  # 구 ckpt의 roll 슬롯 재활용 잔재 제거
         self.grad_scale = {**self.grad_scale, **saved_gs}
         self.roll_ramp = ckpt.get("roll_ramp", self.roll_ramp)
+        self.phys_ramp = ckpt.get("phys_ramp", self.phys_ramp)
+        self._lr_drop_done = ckpt.get("lr_drop_done", self._lr_drop_done)
         self._phys_balanced = ckpt.get("phys_balanced", self._phys_balanced)
         return ckpt["step"], ckpt["metric"], ckpt.get("sched_state", None)

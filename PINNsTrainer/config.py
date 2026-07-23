@@ -173,6 +173,13 @@ def LoadConfig(path):
         "min_patience":       os_.get("min_patience",       10),    # patience 하한 // 후반 노이즈 과민반응 방지
         "min_rel_tol":        os_.get("min_rel_tol",        0.0),   # rel_tol 하한
         "phase2_lr":          os_.get("phase2_lr",          0.0),   # Phase 2 진입 1회 LR (0 = 비활성)
+        # --- Val/Extrap veto gate // 개선 중이면 LR decay 보류 ---
+        "patience_val":       os_.get("patience_val",       3),     # val 미개선 연속 측정 횟수 (× val_interval)
+        "patience_ext":       os_.get("patience_ext",       2),     # extrap 미개선 연속 측정 횟수 (× extrap_sched_interval)
+        "rel_tol_val":        os_.get("rel_tol_val",        0.02),  # val 개선 판정 상대 임계
+        "rel_tol_ext":        os_.get("rel_tol_ext",        0.05),  # extrap 개선 판정 상대 임계
+        "ema_beta_val":       os_.get("ema_beta_val",       0.9),   # val EMA smoothing
+        "ema_beta_ext":       os_.get("ema_beta_ext",       0.9),   # extrap EMA smoothing
     }
 
     return net_cfg, train_cfg, colloc_cfg, data_cfg, t, ode_s_params

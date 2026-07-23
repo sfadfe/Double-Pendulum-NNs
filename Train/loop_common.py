@@ -359,6 +359,9 @@ def RunTrainLoop(
     ROLL_POINTS = t_params.get("roll_points", 12)
     roll_enabled = ROLL_CASES > 0 and trainer.trainCfg.lambda_roll > 0
 
+    # extrap 스케줄러 veto 주기 — rollout_interval과 독립 // 없으면 rollout에 종속(구 동작)
+    EXTRAP_SCHED_INTERVAL = t_params.get("extrap_sched_interval", t_params["rollout_interval"])
+
     PHYS_RAMP_CENTER = train_cfg.phys_ramp_center
     PHYS_RAMP_WIDTH = max(train_cfg.phys_ramp_width, 1)
     LR_DROP_EPOCH = train_cfg.lr_drop_epoch
@@ -507,16 +510,30 @@ def RunTrainLoop(
                 if val_metric < val_best:
                     val_best = val_metric
 
+            # Extrap: 스케줄러 veto용 독립 주기 (rollout_interval과 분리) // decoupled from rollout
+            extrap_loss = float("nan")
+            extrap_omega_loss = float("nan")
+            if extrap_gt is not None and epoch % EXTRAP_SCHED_INTERVAL == 0:
+                trainer._replay_active = False
+                extrap_loss, extrap_omega_loss = ComputeExtrap(trainer, extrap_cases, extrap_gt)
+                if extrap_loss < extrap_best:
+                    extrap_best = extrap_loss
+                tqdm.write(
+                    f"[extrap]  epoch {epoch}  theta={extrap_loss:.3e}"
+                    f"  omega={extrap_omega_loss:.3e}  best={extrap_best:.3e}"
+                )
+
             # replay 에폭(쉬운 nonflip)은 적응 장치에서 격리 // 분포 스위칭이 λ·LR 스케줄을 오염시키지 않도록
+            # OdeScheduler: phys 주신호 + Val/Extrap veto // 둘 중 하나라도 개선 중이면 LR decay 보류
             if not phase1 and epoch_steps > 0 and not replay_epoch:
                 if trainer.phys_ramp >= 1.0:
                     trainer.UpdateReLoBRaLo(avg)
-                ode_sched.Step(avg["phys"], epoch)
+                sched_val = val_metric if (epoch % t_params["val_interval"] == 0) else None
+                sched_ext = extrap_loss if not math.isnan(extrap_loss) else None
+                ode_sched.Step(avg["phys"], epoch, val=sched_val, extrap=sched_ext)
 
             rollout_loss = float("nan")
             rollout_omega_loss = float("nan")
-            extrap_loss = float("nan")
-            extrap_omega_loss = float("nan")
             if epoch % t_params["rollout_interval"] == 0:
                 trainer._replay_active = False
                 rollout_loss, rollout_omega_loss = ComputeRollout(
@@ -531,15 +548,6 @@ def RunTrainLoop(
                     f"[rollout] epoch {epoch}  theta={rollout_loss:.3e}"
                     f"  omega={rollout_omega_loss:.3e}  best={rollout_best:.3e}"
                 )
-
-                if extrap_gt is not None:
-                    extrap_loss, extrap_omega_loss = ComputeExtrap(trainer, extrap_cases, extrap_gt)
-                    if extrap_loss < extrap_best:
-                        extrap_best = extrap_loss
-                    tqdm.write(
-                        f"[extrap]  epoch {epoch}  theta={extrap_loss:.3e}"
-                        f"  omega={extrap_omega_loss:.3e}  best={extrap_best:.3e}"
-                    )
 
             log_rows.append({
                 "Epoch":          epoch,

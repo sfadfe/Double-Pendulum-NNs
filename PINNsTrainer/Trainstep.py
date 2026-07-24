@@ -8,7 +8,9 @@ class LambdaBalance:
         c = self.trainCfg
         self.grad_scale = {"data": 1.0, "kin": 1.0, "phys": 1.0, "energy": 1.0, "ic": 1.0}
         self.roll_ramp = 1.0               # rollout 손실 0→1 램프 계수 (grad_scale 슬롯 재활용 폐기 → 명시 분리) // explicit ramp
-        self.phys_ramp = 0.0               # Phase 2 kin/phys/energy backward sigmoid ramp // loop에서 갱신
+        self.phys_ramp = 0.0               # Phase 2 phys/energy backward sigmoid ramp // loop에서 갱신
+        self.kin_ramp = 1.0                # kin(헤드 커플러) 0→1 램프 — phys_ramp와 독립, Phase 1부터 상시 // loop에서 갱신
+        self._kin_detach = False           # Phase 2에서 True → ω_head가 dθ/dτ 추종 (핸드오프 억제) // loop에서 갱신
         self._lr_drop_done = False         # [train] lr_drop_epoch 1회 하향 완료 // OdeScheduler와 별개
         self._phys_balanced = False        # Phase 2 진입 시 첫 RebalanceGradScales로 True
         self._colloc_ic_sigma = 0.0        # 물리 콜로케이션 IC 섭동 폭 (Phase 3, 매 에폭 램프) // off-manifold
@@ -18,6 +20,7 @@ class LambdaBalance:
         }
         self._lambda_relo = dict(self._base_lambda)  # ReLoBRaLo current weights // 현재 동적 가중치
         self._loss_prev   = {}                        # previous epoch losses // 이전 에폭 손실 (변화율 계산용)
+        self.InitEMA(getattr(c, "ema_decay", 0.0))    # Polyak weight EMA — 평가/best.pt 안정화 (decay<=0 → 비활성)
 
     def _GlobalGradNorm(self):
         # 전 파라미터 grad의 global L2 노름 (단일 sync) // global grad norm over all params
@@ -33,7 +36,8 @@ class LambdaBalance:
         return self.SampleCollocation(t_lo, t_hi)
 
     def _LossChunk(self):
-        return self.dataCfg.batch_size
+        # kin/phys/ic backward 청크 — data 미니배치와 분리 // decoupled from data batch to bound FP64 physics transient peak
+        return self.dataCfg.colloc_chunk or self.dataCfg.batch_size
 
     def _PhysRamp(self):
         # kin/phys/energy backward scale (Phase 1 → 0) // training loop sets self.phys_ramp
@@ -46,8 +50,27 @@ class LambdaBalance:
         self.optimizer.zero_grad(set_to_none=True)
         return gnorm
 
+    def _BackwardKinChunks(self, meta, metric_out, losses_out):
+        # Phase 1 커플러 전용: kin만 backward (jvp, FP64 없음) // 헤드 연결을 데이터피팅과 함께 조기 확립
+        n = meta["tau"].shape[0]
+        chunk = self._LossChunk()
+        lam = self.LambdaAt()
+        kin_acc = 0.0
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            sl = slice(s, e)
+            feats = self._BuildFeats(meta["tau"][sl], meta["params"][sl], meta["ic_state"][sl])
+            lk = self.KinLoss(feats)
+            frac = (e - s) / n
+            weighted = lam["kin"] * self.grad_scale["kin"] * self.kin_ramp * lk * frac
+            weighted.backward(retain_graph=False)
+            kin_acc += float(lk.detach()) * frac
+            metric_out[0] += float(weighted.detach())
+        losses_out["kin"] = kin_acc
+
     def _BackwardPhysicsChunks(self, meta, metric_out, losses_out):
         # Chunked colloc: rebuild feats per chunk // 청크마다 feats 새로 구성
+        # kin은 kin_ramp(구조 커플러, 상시), phys/energy는 phys_ramp(Phase 2)로 분리 게이팅
         n = meta["tau"].shape[0]
         chunk = self._LossChunk()
         lam = self.LambdaAt()
@@ -62,10 +85,12 @@ class LambdaBalance:
             )
             pr = self._PhysRamp()
             combo = (
-                lam["kin"] * self.grad_scale["kin"] * lk
-                + lam["phys"] * self.grad_scale["phys"] * lp
-                + lam["energy"] * self.grad_scale["energy"] * le
-            ) * pr * ((e - s) / n)
+                lam["kin"] * self.grad_scale["kin"] * self.kin_ramp * lk
+                + (
+                    lam["phys"] * self.grad_scale["phys"] * lp
+                    + lam["energy"] * self.grad_scale["energy"] * le
+                ) * pr
+            ) * ((e - s) / n)
             combo.backward(retain_graph=False)
             kin_acc += float(lk.detach()) * ((e - s) / n)
             phys_acc += float(lp.detach()) * ((e - s) / n)
@@ -98,8 +123,9 @@ class LambdaBalance:
                 metric_out[0] += float(weighted.detach())
         losses_out["ic"] = ic_acc
 
-    def BackwardDataIC(self, batch, ic_parts):
-        # Peak VRAM: data then IC, one graph each // data·IC 순차 backward
+    def BackwardDataIC(self, batch, ic_parts, colloc_meta=None):
+        # Peak VRAM: data → (kin) → IC, one graph each // data·(kin)·IC 순차 backward
+        # colloc_meta 주어지면 Phase 1에서도 kin 커플러 활성 (phys/energy 없음) // A1: 헤드 조기 연결
         self.optimizer.zero_grad(set_to_none=True)
         lam = self.LambdaAt()
         losses = {}
@@ -110,6 +136,9 @@ class LambdaBalance:
         w_data.backward(retain_graph=False)
         losses["data"] = float(l_data.detach())
         metric_box[0] += float(w_data.detach())
+
+        if colloc_meta is not None and self.kin_ramp > 0.0:
+            self._BackwardKinChunks(colloc_meta, metric_box, losses)
 
         self._BackwardICChunks(ic_parts, metric_box, losses)
         return metric_box[0], losses

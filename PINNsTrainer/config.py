@@ -49,6 +49,7 @@ class TrainCfg:
     phys_ramp_width: int = 10     # sigmoid 폭 // ramp steepness
     lr_drop_epoch: int = 0        # 고정 LR 1회 하향 에폭 (0=비활성) // OdeScheduler와 별개
     lr_drop_to: float = 0.0       # lr_drop_epoch부터 적용할 LR 상한 // min(cur, lr_drop_to)
+    ema_decay: float = 0.999      # Polyak weight EMA decay (0=비활성) // best.pt/평가 안정화
 
 @dataclass
 class CollocCfg:
@@ -77,6 +78,7 @@ class DataCfg:
     march_dt: float = 1.0     # time-marching window duration (s) // 플로우맵 윈도우 길이 — 네트워크가 보는 상대시간 τ∈[0,march_dt]
     energy_eps: float = 0.01  # energy 상대잔차 분모 바닥값 // floor when |E0|≈|E|≈0 (symmetric denom)
     phys_eps: float = 1.0     # EOM 상대잔차 분모 바닥값 // floor for relative physics residual denom (≈ small frac of typical |dω/dt|)
+    kin_eps: float = 1.0      # kin 상대정규화 분모 바닥값 // floor for mean(dθ/dτ²) denom (dθ/dτ→0 blowup 방지, ≈ small frac of physical ω²)
 
     nonflip_path: str = "data/nonflip_RK4_0_3s.npy"
     flip_path: str = "data/flip_RK4_0_3s.npy"
@@ -85,6 +87,7 @@ class DataCfg:
     scaler_name: str = "scaler.npy"
     scaler_extra_omega: str = ""  # pretrain scaler ω RMS에 포함할 추가 궤적(예: mixed) — flip OOD 방지
     batch_size: int = 8192
+    colloc_chunk: int = 0  # kin/phys/ic backward 청크 크기 // 0이면 batch_size 사용. data 배치와 분리해 FP64 physics transient peak 억제 (측정: 2048이 sweet spot)
 
 
 def LoadConfig(path):
@@ -131,6 +134,7 @@ def LoadConfig(path):
         phys_ramp_width=t.get("phys_ramp_width", 10),
         lr_drop_epoch=t.get("lr_drop_epoch", 0),
         lr_drop_to=t.get("lr_drop_to", 0.0),
+        ema_decay=t.get("ema_decay", 0.999),
     )
 
     colloc_cfg = CollocCfg(
@@ -152,7 +156,9 @@ def LoadConfig(path):
         march_dt=d.get("march_dt", 1.0),   # 구 config 하위호환 // backward-compat for pre-marching configs
         energy_eps=d["energy_eps"],
         phys_eps=d.get("phys_eps", 1.0),   # 구 config 하위호환 // backward-compat for configs predating relative phys loss
+        kin_eps=d.get("kin_eps", 1.0),     # 구 config 하위호환 // backward-compat for configs predating relative kin loss
         batch_size=d["batch_size"],
+        colloc_chunk=d.get("colloc_chunk", 0),
         nonflip_path=d["nonflip_path"],
         data_path=d.get("data_path", d["nonflip_path"]),
         replay_path=d.get("replay_path", d.get("nonflip_path", d["nonflip_path"])),

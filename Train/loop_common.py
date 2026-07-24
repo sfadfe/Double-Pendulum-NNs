@@ -153,7 +153,9 @@ def AppendResumeLog(cfg_path, epoch, step, ckpt_name, changes):
         f.write("\n".join(lines) + "\n")
 
 
-def ReadLogBests(log_path):
+def ReadLogBests(log_path, warmup_epochs=0):
+    # warmup_epochs 이전(phase1 데이터피팅) 행은 val_best에서 제외 — best.pt 선택이
+    # 물리 없는 warmup 모델에 고정되는 것 방지 // phase2 재선택과 일치
     val_best = float("inf")
     rollout_best = float("inf")
     extrap_best = float("inf")
@@ -176,9 +178,11 @@ def ReadLogBests(log_path):
         for row in rows:
             try:
                 # val_best는 θ+ω 합산 지표 기준 (best.pt 선택과 일치) // combined selection metric
-                v = float(row["Val"]) + float(row["ValOmega"])
-                if v == v and v < val_best:
-                    val_best = v
+                # phase1 행은 skip — warmup 데이터피팅 overfit 값이 phase2를 영원히 이기는 것 방지
+                if int(row["Epoch"]) >= warmup_epochs:
+                    v = float(row["Val"]) + float(row["ValOmega"])
+                    if v == v and v < val_best:
+                        val_best = v
             except (ValueError, KeyError, TypeError):
                 pass
             try:
@@ -357,6 +361,8 @@ def RunTrainLoop(
     ROLL_CASES = t_params.get("roll_cases", 256)
     ROLL_DEPTH_MAX = t_params.get("roll_depth_max", 3)
     ROLL_POINTS = t_params.get("roll_points", 12)
+    ROLL_DEPTH_RAMP = max(t_params.get("roll_depth_ramp_epochs", 100), 1)   # B1: depth 1→max per-step epochs
+    KIN_RAMP_EPOCHS = max(t_params.get("kin_ramp_epochs", 40), 1)           # A1: kin 커플러 0→1 램프
     roll_enabled = ROLL_CASES > 0 and trainer.trainCfg.lambda_roll > 0
 
     # extrap 스케줄러 veto 주기 — rollout_interval과 독립 // 없으면 rollout에 종속(구 동작)
@@ -417,6 +423,10 @@ def RunTrainLoop(
             hooks.OnEpochStart(trainer, epoch, phase1, ode_sched, t_params)
             if epoch == DATA_WARMUP_EPOCHS:
                 ode_sched.DropOnPhase2(epoch)
+                # phase1 데이터피팅으로 바닥친 val_best/best.pt 선택 지표 리셋 —
+                # 물리 도입 후(phase2) 모델 기준으로 best.pt 재선택되도록
+                val_best = float("inf")
+                trainer.best_metric = float("inf")
             ApplyLrDrop(trainer, epoch, LR_DROP_EPOCH, LR_DROP_TO)
             # replay 에폭 여부를 에폭 시작 시점에 확정 // val/rollout이 _replay_active를 리셋하기 전 캡처
             replay_epoch = getattr(trainer, "_replay_active", False)
@@ -433,6 +443,11 @@ def RunTrainLoop(
                     trainer.phys_ramp = 0.0
             else:
                 trainer.phys_ramp = 0.0
+
+            # A1: kin(헤드 커플러)는 epoch 0부터 0→1 램프, phys_ramp와 독립 상시 활성
+            trainer.kin_ramp = min(1.0, (epoch + 1) / KIN_RAMP_EPOCHS)
+            # A2: Phase 1 대칭 kin(두 헤드 공동 학습) → Phase 2 ω_head가 dθ/dτ 추종(핸드오프 ω 억제)
+            trainer._kin_detach = not phase1
 
             if (USE_GRAD_BALANCE and not phase1 and not replay_epoch
                     and trainer.phys_ramp >= 0.5
@@ -451,20 +466,23 @@ def RunTrainLoop(
                 for _ in range(t_params["steps_per_segment"]):
                     batch = trainer.SegmentBatch(frame, bs)
                     ic_parts = trainer.ICSamplesRaw()
-                    colloc_meta = None
-                    if not phase1:
-                        colloc_meta = hooks.SampleColloc(trainer, t_lo, t_hi, epoch, phase1)
+                    # colloc은 Phase 1에서도 샘플 — kin 커플러를 데이터피팅과 함께 조기 학습 // A1
+                    # (Phase 1은 ic_sigma=0이라 온-매니폴드, Phase 2에서 오프-매니폴드로 확장)
+                    colloc_meta = hooks.SampleColloc(trainer, t_lo, t_hi, epoch, phase1)
 
                     roll_loss = None
                     if roll_on:
                         sel = trainer.active_cases[
                             torch.randint(0, len(trainer.active_cases), (ROLL_CASES,), device=device)
                         ]
-                        depth = int(torch.randint(1, ROLL_DEPTH_MAX + 1, (1,)).item())
+                        # B1: depth 커리큘럼 — 얕은 핸드오프부터 점진 심화 (초반 깊은 rollout 노이즈 억제)
+                        depth_phase = epoch - roll_anchor
+                        max_depth = max(1, min(ROLL_DEPTH_MAX, 1 + depth_phase // ROLL_DEPTH_RAMP))
+                        depth = int(torch.randint(1, max_depth + 1, (1,)).item())
                         roll_loss = trainer.RolloutLoss(sel, depth, ROLL_POINTS)
 
                     if phase1:
-                        metric_t, losses = trainer.BackwardDataIC(batch, ic_parts)
+                        metric_t, losses = trainer.BackwardDataIC(batch, ic_parts, colloc_meta)
                     else:
                         metric_t, losses = trainer.BackwardAll(batch, colloc_meta, ic_parts, roll_loss=roll_loss)
 
@@ -477,6 +495,7 @@ def RunTrainLoop(
 
                     torch.nn.utils.clip_grad_norm_(trainer.parameters(), train_cfg.grad_clip)
                     trainer.optimizer.step()
+                    trainer.UpdateEMA()   # B3: Polyak shadow ← 매 step raw 가중치
 
                     metric_t = float(metric_t)
                     step += 1
@@ -494,14 +513,21 @@ def RunTrainLoop(
             avg = {k: float(epoch_sums[k]) / epoch_steps if epoch_steps > 0 else float("nan")
                    for k in epoch_sums}
             if phase1:
-                avg["kin"] = avg["phys"] = avg["energy"] = float("nan")
+                # kin은 Phase 1부터 활성(A1)이라 실측값 유지 — phys/energy만 비활성
+                avg["phys"] = avg["energy"] = float("nan")
             if not roll_on:
                 avg["roll"] = float("nan")
+
+            # B3: 평가·best.pt는 EMA 가중치로 — raw는 백업 후 이 구간 동안만 스왑
+            do_val = epoch % t_params["val_interval"] == 0
+            do_ext = extrap_gt is not None and epoch % EXTRAP_SCHED_INTERVAL == 0
+            do_roll = epoch % t_params["rollout_interval"] == 0
+            ema_applied = trainer.ApplyEMA() if (do_val or do_ext or do_roll) else False
 
             val_loss = float("nan")
             val_omega_loss = float("nan")
             val_metric = float("nan")
-            if epoch % t_params["val_interval"] == 0:
+            if do_val:
                 trainer._replay_active = False
                 trainer.active_cases = trainer.val_cases
                 val_loss, val_omega_loss = ComputeVal(trainer, device, data_cfg.batch_size)
@@ -513,7 +539,7 @@ def RunTrainLoop(
             # Extrap: 스케줄러 veto용 독립 주기 (rollout_interval과 분리) // decoupled from rollout
             extrap_loss = float("nan")
             extrap_omega_loss = float("nan")
-            if extrap_gt is not None and epoch % EXTRAP_SCHED_INTERVAL == 0:
+            if do_ext:
                 trainer._replay_active = False
                 extrap_loss, extrap_omega_loss = ComputeExtrap(trainer, extrap_cases, extrap_gt)
                 if extrap_loss < extrap_best:
@@ -528,13 +554,13 @@ def RunTrainLoop(
             if not phase1 and epoch_steps > 0 and not replay_epoch:
                 if trainer.phys_ramp >= 1.0:
                     trainer.UpdateReLoBRaLo(avg)
-                sched_val = val_metric if (epoch % t_params["val_interval"] == 0) else None
+                sched_val = val_metric if do_val else None
                 sched_ext = extrap_loss if not math.isnan(extrap_loss) else None
                 ode_sched.Step(avg["phys"], epoch, val=sched_val, extrap=sched_ext)
 
             rollout_loss = float("nan")
             rollout_omega_loss = float("nan")
-            if epoch % t_params["rollout_interval"] == 0:
+            if do_roll:
                 trainer._replay_active = False
                 rollout_loss, rollout_omega_loss = ComputeRollout(
                     trainer, device, n_cases=t_params["rollout_cases"]
@@ -542,12 +568,17 @@ def RunTrainLoop(
                 if rollout_loss < rollout_best:
                     rollout_best = rollout_loss
                     if save_rollout_best and not math.isnan(rollout_loss):
-                        if trainer.MaybeSaveBest(ckpt_dir, step, rollout_loss, ode_sched.StateDict()):
+                        if trainer.MaybeSaveBest(ckpt_dir, step, rollout_loss, ode_sched.StateDict(),
+                                                 model_state=trainer.ema_state):
                             tqdm.write(f"[best_rollout] step {step}  rollout={rollout_loss:.3e}")
                 tqdm.write(
                     f"[rollout] epoch {epoch}  theta={rollout_loss:.3e}"
                     f"  omega={rollout_omega_loss:.3e}  best={rollout_best:.3e}"
                 )
+
+            # EMA 구간 종료 — 학습·latest.pt는 raw 가중치로 복원 // best.pt는 아래에서 ema_state 명시 저장
+            if ema_applied:
+                trainer.RestoreRaw()
 
             log_rows.append({
                 "Epoch":          epoch,
@@ -587,17 +618,20 @@ def RunTrainLoop(
                 last_save = time.time()
                 tqdm.write(f"[save] latest @ step {step}")
 
-            if epoch % t_params["val_interval"] == 0:
+            if do_val:
                 if not math.isnan(val_metric):
-                    if trainer.MaybeSaveBest(ckpt_dir, step, val_metric, ode_sched.StateDict()):
+                    if trainer.MaybeSaveBest(ckpt_dir, step, val_metric, ode_sched.StateDict(),
+                                             model_state=trainer.ema_state):
                         tqdm.write(f"[best] step {step}  val(θ+ω)={val_metric:.3e}")
 
             if not phase1 and epoch_steps > 0:
-                if trainer.MaybeSaveBestODE(ckpt_dir, step, avg["phys"], ode_sched.StateDict()):
+                if trainer.MaybeSaveBestODE(ckpt_dir, step, avg["phys"], ode_sched.StateDict(),
+                                            model_state=trainer.ema_state):
                     tqdm.write(f"[best_ode] step {step}  ode={avg['phys']:.3e}")
 
             if not math.isnan(extrap_loss):
-                if trainer.MaybeSaveBestExtrap(ckpt_dir, step, extrap_loss, ode_sched.StateDict()):
+                if trainer.MaybeSaveBestExtrap(ckpt_dir, step, extrap_loss, ode_sched.StateDict(),
+                                               model_state=trainer.ema_state):
                     tqdm.write(f"[best_extrap] step {step}  extrap={extrap_loss:.3e}")
 
     except KeyboardInterrupt:

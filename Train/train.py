@@ -76,7 +76,9 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     AppendResumeLog(cfg_path, start_epoch, start_step, ckpt_name, changes)
 
     log_path = ckpt_dir / "log.csv"
-    val_best, rollout_best, extrap_best, ode_best, ode_last = ReadLogBests(log_path)
+    val_best, rollout_best, extrap_best, ode_best, ode_last = ReadLogBests(
+        log_path, warmup_epochs=t_params.get("warmup_epochs", 0)
+    )
 
     if val_best < float("inf"):
         trainer.best_metric = val_best

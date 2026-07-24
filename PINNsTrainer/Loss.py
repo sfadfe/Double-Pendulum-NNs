@@ -21,6 +21,23 @@ class Loss:
         (theta, omega), (dtheta_dt, domega_dt) = tf.jvp(f, (t,), (ones,))
         return theta, omega, dtheta_dt, domega_dt
 
+    def _KinTerm(self, omega, dtheta_dt):
+        # kin = 두 헤드를 잇는 커플러 (ω := dθ/dτ). // structural glue, not a physics law
+        # 상대 정규화: 분모 = mean(dθ/dτ²).detach() → 미학습 랜덤 init의 거대 magnitude를 상쇄해
+        #   gradient가 스케일 무관하게 bounded. raw면 init grad가 data를 4000× 지배(측정) → data피팅 잠식.
+        #   phys loss의 상대잔차 철학과 동일 // [[phys-loss-relative-norm]]
+        # _kin_detach=True(Phase 2): dθ/dτ 기준 고정, ω_head가 추종 → rollout 핸드오프 ω 드리프트 억제.
+        # _kin_detach=False(Phase 1): 대칭 — 두 헤드가 함께 커플링 학습.
+        scale = dtheta_dt.detach().pow(2).mean() + self.dataCfg.kin_eps
+        if getattr(self, "_kin_detach", False):
+            return torch.mean((omega - dtheta_dt.detach()) ** 2) / scale
+        return torch.mean((dtheta_dt - omega) ** 2) / scale
+
+    def KinLoss(self, feats):
+        # Phase 1 커플링 전용: kin만 (jvp, FP64 EOM/energy 없음) // cheap structural coupling
+        _, omega, dtheta_dt, _ = self.StateDerivs(feats.float())
+        return self._KinTerm(omega, dtheta_dt)
+
     def DataLoss(self, feats, theta_true, omega_true):
         out = self(feats)                                 # (N, 4)
         theta, omega = out[:, :2], out[:, 2:]
@@ -31,7 +48,7 @@ class Loss:
     def _PhysicsEnergySlice(self, feats, params, e0, ic_theta):
         # Single colloc slice // 콜로케이션 청크 1개분 물리+에너지 손실
         theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
-        l_kin = torch.mean((dtheta_dt - omega) ** 2)
+        l_kin = self._KinTerm(omega, dtheta_dt)
 
         with torch.autocast(device_type=self.device_type, enabled=False):
             p64 = params.double()

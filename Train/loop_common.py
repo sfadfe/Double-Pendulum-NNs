@@ -274,7 +274,7 @@ class PretrainHooks:
 
 
 class FinetuneHooks(PretrainHooks):
-    # Replay active_cases + RAR collocation // flip 파인튜닝 전용 훅
+    # Replay active_cases + flip-biased fresh collocation // flip 파인튜닝 전용 훅
 
     def OnLoopStart(self, trainer, device, data_cfg, t_params):
         n = trainer.trainCfg.n_colloc_cases or trainer.max_cases
@@ -303,23 +303,7 @@ class FinetuneHooks(PretrainHooks):
             return trainer.GetCollocMeta(t_lo, t_hi, case_pool=trainer.active_cases)
         return trainer.GetCollocMeta(t_lo, t_hi)
 
-    def OnStepEnd(self, trainer, step, epoch, phase1, t_lo=None, t_hi=None):
-        # replay epoch: flip RAR 풀 갱신 스킵 // nonflip 콜로케이션은 매 세그먼트 fresh sample
-        if getattr(trainer, "_replay_active", False):
-            return False
-        # PLAN: rar_every마다 모든 세그먼트 풀 refine // 한 세그먼트만 갱신되던 버그 수정
-        if phase1:
-            return False
-        every = trainer.collocCfg.rar_every
-        if every <= 0 or step % every != 0:
-            return False
-        for seg_lo, seg_hi in trainer.segments:
-            p50, p90, n_pool = trainer.RefineCollocPool(seg_lo, seg_hi)
-            tqdm.write(
-                f"[rar] step {step} seg [{seg_lo},{seg_hi}]  "
-                f"residual p50={p50:.2e} p90={p90:.2e}  pool={n_pool}"
-            )
-        return True
+    # OnStepEnd: PretrainHooks 상속 (콜로케이션은 매 step fresh 재샘플 — refine 훅 불필요)
 
 
 def RunTrainLoop(

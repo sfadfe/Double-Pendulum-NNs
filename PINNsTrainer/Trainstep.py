@@ -269,29 +269,19 @@ class LambdaBalance:
 
 
 class TimeMarching:
-    # Non-overlapping march windows + LHS/RAR 콜로케이션
-    def _InitCollocPools(self):
-        if not hasattr(self, "_colloc_pools"):
-            self._colloc_pools = {}
-
+    # Non-overlapping march windows + fresh uniform-τ 콜로케이션 (매 step 재샘플, persistent pool 없음)
     def _CollocCasePool(self):
-        # RAR 풀 전용 case 집합; 미설정 시 active_cases 폴백 // finetune은 colloc_cases 고정
+        # colloc case 집합; 미설정(pretrain) 시 active_cases 폴백 // finetune은 flip-biased colloc_cases 고정
         pool = getattr(self, "colloc_cases", None)
         if pool is None:
             return self.active_cases
         return pool
 
-    def _LHSTau(self, n, span):
-        dev = self.device
-        edges = torch.linspace(0.0, 1.0, n + 1, device=dev)
-        u = edges[:-1] + torch.rand(n, device=dev) * (1.0 / n)
-        u = u[torch.randperm(n, device=dev)]
-        return (u * span).reshape(-1, 1)
-
     def _SampleCollocMeta(self, t_lo, t_hi, case_pool, n=None):
+        # Fresh 콜로케이션: iid uniform τ∈[0,span] + case_pool 균등 추출 // 매 호출 재샘플
         n = n or self.collocCfg.n_colloc
         span = t_hi - t_lo
-        tau = self._LHSTau(n, span)
+        tau = torch.rand(n, 1, device=self.device) * span
 
         local_idx = torch.randint(0, len(case_pool), (n,), device=self.device)
         pool = case_pool.to(self.device) if case_pool.device != self.device else case_pool
@@ -309,29 +299,14 @@ class TimeMarching:
         params = params_src[ci]
         if params.device != self.device:
             params = params.to(self.device)
-        # off-manifold IC 섭동 (Phase 3, 에폭 램프) // ic_base 보존해 RAR 재충전 시 재섭동
+        # off-manifold IC 섭동 (Phase 3, 에폭 램프) // ic_sigma 램프
         sigma = getattr(self, "_colloc_ic_sigma", 0.0)
         ic_state = ic_base + sigma * torch.randn_like(ic_base) if sigma > 0.0 else ic_base
         e0 = self.GetEnergy(ic_state.double(), params.double()).detach()
-        return {
-            "tau": tau,
-            "case_idx": case_idx,
-            "ic_base": ic_base,
-            "ic_state": ic_state,
-            "params": params,
-            "e0": e0,
-            "step_birth": getattr(self, "_global_step", 0),
-        }
-
-    def _MetaToColloc(self, meta):
-        # meta["params"]로 직접 feats 구성 — _replay_active 전역 상태 의존 제거 // params mismatch 버그 수정
-        feats = self._BuildFeats(meta["tau"], meta["params"], meta["ic_state"])
-        ic_theta = meta["ic_state"][:, [0, 2]]
-        return feats, meta["params"], meta["e0"], ic_theta
+        return {"tau": tau, "ic_state": ic_state, "params": params, "e0": e0}
 
     def SetupCollocCases(self, n_colloc=None, flip_bias=0.0):
-        # flip finetune: colloc_cases 고정(stratified) + RAR 풀 초기화
-        self._InitCollocPools()
+        # flip finetune: flip-biased colloc_cases 고정(stratified) // 명시적 is_flip balancing
         pool = self.train_pool
         n = n_colloc or self.trainCfg.n_colloc_cases or self.max_cases
         n = min(int(n), len(pool))
@@ -350,43 +325,12 @@ class TimeMarching:
         else:
             perm = torch.randperm(len(pool), device=self.device)[:n]
             self.colloc_cases = pool[perm]
-
-        for t_lo, t_hi in self.segments:
-            self.InitCollocPool(t_lo, t_hi)
         self._colloc_inited = True
 
-    def InitCollocPool(self, t_lo, t_hi):
-        self._InitCollocPools()
-        key = (t_lo, t_hi)
-        self._colloc_pools[key] = self._SampleCollocMeta(
-            t_lo, t_hi, self._CollocCasePool()
-        )
-
     def GetCollocMeta(self, t_lo, t_hi, case_pool=None):
-        # Collocation meta (no feats) — feats built per chunk at train time // 학습 시 청크별 feats 생성
-        if case_pool is not None:
-            return self._SampleCollocMeta(t_lo, t_hi, case_pool)
-        self._InitCollocPools()
-        key = (t_lo, t_hi)
-        if key not in self._colloc_pools:
-            self.InitCollocPool(t_lo, t_hi)
-        return self._colloc_pools[key]
-
-    def GetColloc(self, t_lo, t_hi, case_pool=None):
-        # Legacy feats tuple — RAR / diagnostics only // RAR·진단용 feats 튜플
-        return self._MetaToColloc(self.GetCollocMeta(t_lo, t_hi, case_pool=case_pool))
-
-    def RefineCollocPool(self, t_lo, t_hi):
-        key = (t_lo, t_hi)
-        pool = self._colloc_pools[key]
-        span = t_hi - t_lo
-        feats, params, e0, ic_theta = self._MetaToColloc(pool)
-        residual = self.PhysicsResidualPerPoint(feats, params, e0, ic_theta)
-        self._colloc_pools[key] = self.RARUpdate(pool, residual, span)
-        self._colloc_pools[key]["step_birth"] = getattr(self, "_global_step", 0)
-        p50 = float(torch.quantile(residual, 0.5))
-        p90 = float(torch.quantile(residual, 0.9))
-        return p50, p90, int(pool["tau"].shape[0])
+        # Fresh collocation meta (no feats) — feats built per chunk at train time // 매 호출 재샘플
+        pool = case_pool if case_pool is not None else self._CollocCasePool()
+        return self._SampleCollocMeta(t_lo, t_hi, pool)
 
     def BuildSegments(self, t_min, t_max):
         # Windows of duration march_dt; the network sees relative time τ∈[0,march_dt] // 비겹침 마칭 윈도우
@@ -454,45 +398,3 @@ class TimeMarching:
         ic_flat = state.repeat_interleave(p, dim=0)
         feats = self._BuildFeats(tau_flat, params_flat, ic_flat)
         return self(feats).reshape(n, p, 4)
-
-    def RARUpdate(self, pool, residual, span):
-        # 잔차 하위 제거 + 상위 근방 τ jitter 재충전, N 유지 // 풀 메타 in/out
-        c = self.collocCfg
-        n = pool["tau"].shape[0]
-        order = torch.argsort(residual, descending=True)
-        n_top = max(1, int(c.rar_top_frac * n))
-        n_bot = max(1, int(c.rar_bot_frac * n))
-        n_bot = min(n_bot, n - 1)
-
-        keep = order[: n - n_bot]
-        tau_k = pool["tau"][keep]
-        case_k = pool["case_idx"][keep]
-        base_k = pool["ic_base"][keep]
-        ic_k = pool["ic_state"][keep]
-        params_k = pool["params"][keep]
-        e0_k = pool["e0"][keep]
-
-        top = order[:n_top]
-        reps = (n_bot + n_top - 1) // n_top
-        src = top.repeat(reps)[:n_bot]
-
-        delta = c.rar_jitter_frac * self.dataCfg.march_dt
-        jitter = (torch.rand(n_bot, 1, device=tau_k.device) - 0.5) * 2.0 * delta
-        tau_new = (pool["tau"][src] + jitter).clamp(0.0, span)
-
-        # 재충전 점은 현재 sigma로 ic_base 재섭동 + e0 재계산 // ic_sigma 램프 활성화
-        base_new = pool["ic_base"][src]
-        params_new = pool["params"][src]
-        sigma = getattr(self, "_colloc_ic_sigma", 0.0)
-        ic_new = base_new + sigma * torch.randn_like(base_new) if sigma > 0.0 else base_new
-        e0_new = self.GetEnergy(ic_new.double(), params_new.double()).detach()
-
-        return {
-            "tau": torch.cat([tau_k, tau_new], dim=0),
-            "case_idx": torch.cat([case_k, pool["case_idx"][src]], dim=0),
-            "ic_base": torch.cat([base_k, base_new], dim=0),
-            "ic_state": torch.cat([ic_k, ic_new], dim=0),
-            "params": torch.cat([params_k, params_new], dim=0),
-            "e0": torch.cat([e0_k, e0_new], dim=0),
-            "step_birth": pool.get("step_birth", 0),
-        }

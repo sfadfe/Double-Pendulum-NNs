@@ -43,7 +43,7 @@ class TrainCfg:
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
     replay_frac: float = 0.25
-    n_colloc_cases: int = 0       # finetune RAR 풀 크기 (0 → max_cases)
+    n_colloc_cases: int = 0       # finetune colloc case 풀 크기 (0 → max_cases)
     phys_ramp_epochs: int = 60    # sigmoid ramp 참고 길이 (문서·로그) // reference span
     phys_ramp_center: int = 30    # e2 = epoch - warmup_epochs 기준 중심
     phys_ramp_width: int = 10     # sigmoid 폭 // ramp steepness
@@ -60,11 +60,7 @@ class CollocCfg:
     ## VRAM 공간 남으면 20000에서 30000~50000으로 늘릴 가능성 고려.
     ## 실제 학습 시간은 FP64 연산에서 많이 소모됨. 늘려도 상관없음
 
-    rar_top_frac: float = 0.2
-    rar_bot_frac: float = 0.2
-    rar_every: int = 1000
-    rar_jitter_frac: float = 0.08   # τ jitter = ± frac * march_dt
-    colloc_flip_bias: float = 0.0   # finetune: flip case 하한 비율 (0=uniform)
+    colloc_flip_bias: float = 0.0   # finetune: flip case 하한 비율 (0=uniform) // 명시적 is_flip balancing
 
     ic_sigma: float = 0.0             # Phase 3: 물리 콜로케이션 IC 섭동 target (0=비활성)
     ic_sigma_warmup: int = 200        # sigma 0→target 선형 램프 에폭 (Phase 2 진입 후)
@@ -141,10 +137,6 @@ def LoadConfig(path):
         seg_count=c["seg_count"],
         overlap_frac=c["overlap_frac"],
         n_colloc=c["n_colloc"],
-        rar_top_frac=c["rar_top_frac"],
-        rar_bot_frac=c["rar_bot_frac"],
-        rar_every=c["rar_every"],
-        rar_jitter_frac=c.get("rar_jitter_frac", 0.08),
         colloc_flip_bias=c.get("colloc_flip_bias", 0.0),
         ic_sigma=c.get("ic_sigma", 0.0),
         ic_sigma_warmup=c.get("ic_sigma_warmup", 200),

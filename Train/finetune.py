@@ -114,7 +114,7 @@ def Finetune(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Flip fine-tuning with replay + RAR")
+    parser = argparse.ArgumentParser(description="Flip fine-tuning with replay + flip-biased colloc")
     parser.add_argument("--pretrain", type=str, required=True, help="pretrain model 폴더")
     parser.add_argument("--ckpt", type=str, default="extrap", choices=list(_CKPT_FILES),
                         help="불러올 pretrain 체크포인트")

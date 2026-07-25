@@ -143,9 +143,23 @@ class Loss:
             seg = seg.to(self.device)
         theta_true = seg[:, :, [1, 3]]
         omega_true = seg[:, :, [2, 4]]
-        return torch.mean((theta_pred - theta_true) ** 2) + torch.mean(
+        per_case = ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
             (omega_pred - omega_true) ** 2
-        )
+        ).mean(dim=(1, 2))
+        return self._RobustRollMean(per_case)
+
+    def _RobustRollMean(self, per_case):
+        # Heavy-tail 억제: 발산 케이스 소수가 평균을 독식 → 그 스텝 gradient를 통째로 강탈.
+        #   측정(88ep finetune): flip 에폭의 44%가 평균 roll>100, 중앙값은 ~7 — 3~5자리 tail.
+        #   clip_grad_norm_은 전 항 합산 후 걸리므로 이때 data/phys/kin gradient가 사실상 소거됨.
+        # Cauchy/Lorentzian: c·log1p(l/c) — 중앙값 근처는 준선형, l≫c는 log로 압축.
+        #   d/dl = 1/(1+l/c) → 발산 케이스도 방향은 유지, 크기만 c/l로 감쇠 // 방향 보존 tail 감쇠
+        # c는 배치 median의 배수(detach) → 하이퍼파라미터 없이 학습 진행에 따라 자동 축소.
+        k = self.trainCfg.roll_robust_k
+        if k <= 0.0:
+            return per_case.mean()                      # 0 → 기존 순수 평균 // opt-out
+        c = k * per_case.detach().median() + 1e-12
+        return (c * torch.log1p(per_case / c)).mean()
 
     def ComputeAllLosses(self, batch, colloc, ic):
         l_data = self.DataLoss(*batch)

@@ -1,5 +1,6 @@
 import csv
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -382,6 +383,15 @@ def RunTrainLoop(
     if start_epoch >= LR_DROP_EPOCH and LR_DROP_EPOCH > 0:
         trainer._lr_drop_done = True
 
+    # tqdm.write는 stdout에 쓰고 flush하지 않음 — 파일로 리다이렉트하면 stdout이 8KB 블록 버퍼라
+    # bar(stderr, 무버퍼)만 흘러나오고 [replay]/[balance]/[best] 로그가 버퍼에 갇힌다.
+    # (bar 생성 시 tqdm이 1회 flush하므로 그 이전 메시지만 보였음) // 줄 단위 버퍼로 전환
+    for _fp in (sys.stdout, sys.stderr):
+        try:
+            _fp.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+
     pbar = tqdm(range(start_epoch, t_params["max_epochs"]), desc="Training", dynamic_ncols=True)
 
     try:
@@ -401,8 +411,10 @@ def RunTrainLoop(
                     else None
                 )
             roll_on = roll_enabled and not phase1 and roll_anchor is not None and epoch >= roll_anchor
+            trainer._roll_active = roll_on          # RebalanceGradScales가 roll 측정 여부 판단
             if roll_on:
                 trainer.roll_ramp = min(1.0, (epoch - roll_anchor + 1) / max(ROLL_RAMP, 1))
+                trainer._roll_depth = max(1, min(ROLL_DEPTH_MAX, 1 + (epoch - roll_anchor) // ROLL_DEPTH_RAMP))
 
             hooks.OnEpochStart(trainer, epoch, phase1, ode_sched, t_params)
             if epoch == DATA_WARMUP_EPOCHS:
@@ -430,8 +442,11 @@ def RunTrainLoop(
 
             # A1: kin(헤드 커플러)는 epoch 0부터 0→1 램프, phys_ramp와 독립 상시 활성
             trainer.kin_ramp = min(1.0, (epoch + 1) / KIN_RAMP_EPOCHS)
-            # A2: Phase 1 대칭 kin(두 헤드 공동 학습) → Phase 2 ω_head가 dθ/dτ 추종(핸드오프 ω 억제)
-            trainer._kin_detach = not phase1
+            # A2: kin은 항상 대칭 — 두 헤드가 함께 커플링 학습.
+            #   detach=True로 두면 dθ/dτ에 걸린 유일한 gradient 제약이 사라짐(EOM은 dω/dτ만,
+            #   energy는 E만 제약) → θ 헤드 미분이 발산. 측정: corr(ω,dθ/dτ) 0.995 → 0.120,
+            #   RMS(dθ/dτ) 16.4 vs RMS(ω) 1.88 (2026_07_24 런). // 항상 False
+            trainer._kin_detach = False
 
             if (USE_GRAD_BALANCE and not phase1 and not replay_epoch
                     and trainer.phys_ramp >= 0.5
@@ -440,8 +455,10 @@ def RunTrainLoop(
                 gs = trainer.grad_scale
                 tqdm.write(
                     f"[balance] epoch {epoch}  ‖g‖ data={g['data']:.2e} kin={g['kin']:.2e} "
-                    f"phys={g['phys']:.2e} energy={g['energy']:.2e} ic={g['ic']:.2e} | "
-                    f"scale kin={gs['kin']:.2e} phys={gs['phys']:.2e} energy={gs['energy']:.2e} ic={gs['ic']:.2e}")
+                    f"phys={g['phys']:.2e} energy={g['energy']:.2e} ic={g['ic']:.2e}"
+                    f"{' roll=%.2e' % g['roll'] if 'roll' in g else ''} | "
+                    f"scale kin={gs['kin']:.2e} phys={gs['phys']:.2e} energy={gs['energy']:.2e} "
+                    f"ic={gs['ic']:.2e} roll={gs['roll']:.2e}")
 
             for t_lo, t_hi in trainer.segments:
                 frame = trainer.SegmentFrame(t_lo, t_hi)
@@ -460,9 +477,8 @@ def RunTrainLoop(
                             torch.randint(0, len(trainer.active_cases), (ROLL_CASES,), device=device)
                         ]
                         # B1: depth 커리큘럼 — 얕은 핸드오프부터 점진 심화 (초반 깊은 rollout 노이즈 억제)
-                        depth_phase = epoch - roll_anchor
-                        max_depth = max(1, min(ROLL_DEPTH_MAX, 1 + depth_phase // ROLL_DEPTH_RAMP))
-                        depth = int(torch.randint(1, max_depth + 1, (1,)).item())
+                        # 상한은 에폭 시작 시 trainer._roll_depth로 계산 — 밸런싱 측정과 같은 값 공유
+                        depth = int(torch.randint(1, trainer._roll_depth + 1, (1,)).item())
                         roll_loss = trainer.RolloutLoss(sel, depth, ROLL_POINTS)
 
                     if phase1:

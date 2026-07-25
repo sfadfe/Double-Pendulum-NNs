@@ -50,6 +50,9 @@ class TrainCfg:
     lr_drop_epoch: int = 0        # 고정 LR 1회 하향 에폭 (0=비활성) // OdeScheduler와 별개
     lr_drop_to: float = 0.0       # lr_drop_epoch부터 적용할 LR 상한 // min(cur, lr_drop_to)
     ema_decay: float = 0.999      # Polyak weight EMA decay (0=비활성) // best.pt/평가 안정화
+    roll_robust_k: float = 4.0    # rollout Cauchy 스케일 = k × 배치 median (0=비활성, 순수 mean) // heavy-tail 억제
+    roll_balance_cases: int = 128 # RebalanceGradScales의 roll grad 노름 측정용 케이스 수 // 측정 비용 절감
+    roll_balance_points: int = 12 # 위 측정의 윈도우 내 시점 수 // 학습 스텝의 roll_points와 동일 스케일
 
 @dataclass
 class CollocCfg:
@@ -131,6 +134,9 @@ def LoadConfig(path):
         lr_drop_epoch=t.get("lr_drop_epoch", 0),
         lr_drop_to=t.get("lr_drop_to", 0.0),
         ema_decay=t.get("ema_decay", 0.999),
+        roll_robust_k=t.get("roll_robust_k", 4.0),
+        roll_balance_cases=t.get("roll_balance_cases", 128),
+        roll_balance_points=t.get("roll_balance_points", 12),
     )
 
     colloc_cfg = CollocCfg(

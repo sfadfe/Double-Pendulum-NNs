@@ -6,7 +6,9 @@ class LambdaBalance:
     
     def InitLambda(self):
         c = self.trainCfg
-        self.grad_scale = {"data": 1.0, "kin": 1.0, "phys": 1.0, "energy": 1.0, "ic": 1.0}
+        self.grad_scale = {"data": 1.0, "kin": 1.0, "phys": 1.0, "energy": 1.0, "ic": 1.0, "roll": 1.0}
+        self._roll_active = False          # roll_on 미러 — RebalanceGradScales가 roll 측정 여부 판단 // loop에서 갱신
+        self._roll_depth = 1               # 현재 depth 커리큘럼 상한 — 밸런싱 측정도 같은 depth로 // loop에서 갱신
         self.roll_ramp = 1.0               # rollout 손실 0→1 램프 계수 (grad_scale 슬롯 재활용 폐기 → 명시 분리) // explicit ramp
         self.phys_ramp = 0.0               # Phase 2 phys/energy backward sigmoid ramp // loop에서 갱신
         self.kin_ramp = 1.0                # kin(헤드 커플러) 0→1 램프 — phys_ramp와 독립, Phase 1부터 상시 // loop에서 갱신
@@ -160,7 +162,9 @@ class LambdaBalance:
         self._BackwardICChunks(ic_parts, metric_box, losses)
 
         if roll_loss is not None:
-            w_roll = lam["roll"] * self.roll_ramp * roll_loss
+            # roll도 grad_scale 경유 — 유일하게 밸런싱 밖에 있던 항. clip_grad_norm_은 전 항
+            # 합산 뒤에 걸리므로 roll만 raw면 폭주 시 나머지 gradient가 소거됨 // 측정 근거는 _RobustRollMean
+            w_roll = lam["roll"] * self.grad_scale["roll"] * self.roll_ramp * roll_loss
             w_roll.backward(retain_graph=False)
             losses["roll"] = float(roll_loss.detach())
             metric_box[0] += float(w_roll.detach())
@@ -171,6 +175,8 @@ class LambdaBalance:
         # B: 항목별 독립 forward-backward로 grad 노름 측정 // retain_graph 없이 peak VRAM 절약
         self.train()
         sums = {"data": 0.0, "kin": 0.0, "phys": 0.0, "energy": 0.0, "ic": 0.0}
+        if self._roll_active:
+            sums["roll"] = 0.0
         cnt = 0
         chunk = self._LossChunk()
         for _ in range(n_batches):
@@ -205,6 +211,17 @@ class LambdaBalance:
                 sums["ic"] += self._GradNormOfLoss(
                     self._ICLossSlice(ic_feats, part0["theta0"][:e_ic], part0["omega0"][:e_ic])
                 )
+
+                if self._roll_active:
+                    # roll은 세그먼트 루프와 무관(자체적으로 윈도우 추첨) — 학습 스텝과 동일 조건으로 측정
+                    n_roll = min(self.trainCfg.roll_balance_cases, len(self.active_cases))
+                    sel = self.active_cases[
+                        torch.randint(0, len(self.active_cases), (n_roll,), device=self.device)
+                    ]
+                    depth = int(torch.randint(1, max(1, self._roll_depth) + 1, (1,)).item())
+                    sums["roll"] += self._GradNormOfLoss(
+                        self.RolloutLoss(sel, depth, self.trainCfg.roll_balance_points)
+                    )
 
                 cnt += 1
                 del colloc_meta, batch, ic_parts, frame

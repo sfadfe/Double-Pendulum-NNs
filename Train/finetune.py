@@ -72,7 +72,7 @@ def Finetune(
     if not scaler_src.exists():
         raise FileNotFoundError(f"pretrain scaler not found: {scaler_src}")
 
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision(train_cfg.matmul_precision)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
@@ -129,7 +129,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = args.config or str(Path(__file__).parent / "config_finetune.toml")
-    run_dir = Init(args.out)
+    if args.out is None:
+        _, _, _, _, t_params, _ = LoadConfig(cfg)
+        run_name = t_params.get("name", "_ft_adapter")
+        run_dir = InitCkptDir(suffix=run_name)
+    else:
+        run_dir = Path(args.out)
+        run_dir.mkdir(parents=True, exist_ok=True)
     Finetune(run_dir, args.pretrain, cfg, ckpt_name=args.ckpt, seed=args.seed,
              max_epochs=args.max_epochs, data_path=args.data,
              max_cases=args.max_cases, n_val=args.n_val)

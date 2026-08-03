@@ -29,7 +29,7 @@ def Train(MainFolderPath):
 
     shutil.copy(cfg_path, MainFolderPath / "config.toml")
 
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision(train_cfg.matmul_precision)
     device = "cuda" if torch.cuda.is_available() else "cpu"     
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
@@ -55,7 +55,7 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     cfg_path = ckpt_dir / "config.toml"
     net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
 
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision(train_cfg.matmul_precision)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
@@ -76,7 +76,7 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     AppendResumeLog(cfg_path, start_epoch, start_step, ckpt_name, changes)
 
     log_path = ckpt_dir / "log.csv"
-    val_best, rollout_best, extrap_best, ode_best, ode_last = ReadLogBests(
+    val_best, rollout_best, extrap_best, ode_best = ReadLogBests(
         log_path, warmup_epochs=t_params.get("warmup_epochs", 0)
     )
 
@@ -99,7 +99,7 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
         extrap_best=extrap_best,
         log_path=log_path, log_rows=prior_rows,
         ckpt_dir=ckpt_dir, ode_sched_cls=OdeScheduler,
-        ode_s_params=ode_s_params, ode_ema_init=ode_last,
+        ode_s_params=ode_s_params,
         ode_sched_state=sched_state,
     )
 
@@ -118,5 +118,8 @@ if __name__ == "__main__":
         ckpt_path = Path(args.resume) / _CKPT_FILES[args.ckpt]
         Resume(ckpt_path, new_lr=args.lr, ckpt_name=args.ckpt)
     else:
-        MainFolderPath = InitCkptDir()
+        cfg_path = Path(__file__).parent / "config.toml"
+        net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
+        run_name = t_params.get("name", "")
+        MainFolderPath = InitCkptDir(suffix=run_name)
         Train(MainFolderPath)

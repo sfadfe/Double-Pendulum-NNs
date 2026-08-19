@@ -59,23 +59,6 @@ class Physics:
             dim=1,
         )
 
-    def RK4(self, state, params, trigs=None, dt=None):
-        if dt is None:
-            dt = self.dt
-
-        k1 = self.ODE(state, params, trigs=trigs)
-
-        s2 = state + 0.5 * dt * k1
-        k2 = self.ODE(s2, params)
-
-        s3 = state + 0.5 * dt * k2
-        k3 = self.ODE(s3, params)
-
-        s4 = state + dt * k3
-        k4 = self.ODE(s4, params)
-
-        return state + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
     def GetEnergy(self, state, params):
         th1, w1, th2, w2 = state[:, 0], state[:, 1], state[:, 2], state[:, 3]
         m1, m2, L1, L2 = params[:, 0], params[:, 1], params[:, 2], params[:, 3]
@@ -91,15 +74,4 @@ class Physics:
         V = m1 * self.g * y1 + m2 * self.g * y2
 
         return K + V
-
-    def RolloutRK4(self, state0, params, K, dt=None):
-        # K-step RK4 rollout // returns (K, N, 4)
-        if dt is None:
-            dt = self.dt
-        states = []
-        s = state0
-        for _ in range(K):
-            s = self.RK4(s, params, dt=dt)
-            states.append(s)
-        return torch.stack(states, dim=0)
 

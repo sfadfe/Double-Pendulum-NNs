@@ -437,7 +437,6 @@ def RunTrainLoop(
     DATA_WARMUP_EPOCHS = t_params.get("warmup_epochs", 200)
     GRAD_BALANCE_EVERY = t_params.get("grad_balance_every", 25)
     GRAD_BALANCE_BATCHES = t_params.get("grad_balance_batches", 3)
-    USE_GRAD_BALANCE = t_params.get("use_grad_balance", True)
     # drift 트리거 (0 = 비활성 → grad_balance_every 고정 주기, 구 config 하위호환) // trap 18/21
     GRAD_BALANCE_DRIFT = t_params.get("grad_balance_drift", 0.0)
     GRAD_BALANCE_MIN_EVERY = t_params.get("grad_balance_min_every", 0) or GRAD_BALANCE_EVERY
@@ -584,7 +583,7 @@ def RunTrainLoop(
                     drift = trainer.GnormDrift(gnorm_ref)
 
             do_balance = False
-            if USE_GRAD_BALANCE and not phase1 and not replay_epoch and trainer.phys_ramp >= 0.5:
+            if not phase1 and not replay_epoch and trainer.phys_ramp >= 0.5:
                 since = GRAD_BALANCE_MAX_EVERY if last_balance_e2 is None else e2 - last_balance_e2
                 if GRAD_BALANCE_DRIFT > 0 and gnorm_ref is not None:
                     # min_every = 폭주 방지 하한, max_every = 후반 희소화 상한 // floor/ceiling
@@ -611,7 +610,7 @@ def RunTrainLoop(
                     f"{'ic=%.2e ' % gs['ic'] if 'ic' in g else ''}roll={gs['roll']:.2e}"
                     + (f" | since={since} drift={'--' if drift is None else '%.3f' % drift}"
                        if GRAD_BALANCE_DRIFT > 0 else ""))
-                # 항별 clip 직전 노름 EMA — 예산(term_grad_clip) 대비 포화 여부. 예산에 붙은 항은
+                # 항별 clip 직전 노름 EMA — 예산(grad_clip) 대비 포화 여부. 예산에 붙은 항은
                 # 그만큼 눌리고 있다는 뜻이고, 안 붙은 항은 원래 크기로 통과 중이다. // saturation probe
                 tg = trainer._term_gnorm
                 if tg:
@@ -647,17 +646,25 @@ def RunTrainLoop(
                     else:
                         metric_t, losses = trainer.BackwardAll(batch, colloc_meta, ic_parts, roll_loss=roll_loss)
 
-                    # 스텝당 host sync는 여기 1회뿐 — NaN이면 optimizer.step을 건너뛰어야 하므로
-                    # 이 판정만은 CPU 값이 필요하다. 항·청크별 float()는 Trainstep에서 제거됨.
-                    metric_f = float(metric_t)
-                    if not math.isfinite(metric_f):
+                    # 손실이 유한해도 grad는 NaN/Inf일 수 있다 (roll의 Huber/clamp 경로가 실제로 그랬다).
+                    # 손실만 보던 구판은 그 스텝을 통과시켜 가중치를 오염시켰고, 이후 전 항이 NaN이
+                    # 되면서 런이 죽었다 (2026-08-19 _ft_adapter, ep218). clip 반환값 = 클립 전 전체
+                    # grad 노름이라 추가 비용 없이 grad 쪽 판정을 얻는다. // guard grads, not just loss
+                    gnorm = torch.nn.utils.clip_grad_norm_(trainer.parameters(), train_cfg.grad_clip)
+                    # 스텝당 host sync는 여기 1회뿐 — 손실·grad 두 판정값을 한 텐서로 묶어 sync를 늘리지
+                    # 않는다. 항·청크별 float()는 Trainstep에서 제거됨.
+                    metric_f, gnorm_f = torch.stack(
+                        [metric_t.detach().float(), gnorm.detach().float()]
+                    ).tolist()
+                    if not (math.isfinite(metric_f) and math.isfinite(gnorm_f)):
                         trainer.optimizer.zero_grad()
                         nan_keys = [k for k, v in losses.items() if not math.isfinite(float(v))]
+                        if not nan_keys:
+                            nan_keys = [f"grad-only(‖g‖={gnorm_f:.3e})"]
                         print(f"[NaN] skipping step — affected: {nan_keys}")
                         step += 1
                         continue
 
-                    torch.nn.utils.clip_grad_norm_(trainer.parameters(), train_cfg.grad_clip)
                     trainer.optimizer.step()
                     trainer.UpdateEMA()   # B3: Polyak shadow ← 매 step raw 가중치
 

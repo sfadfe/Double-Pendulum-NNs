@@ -1,0 +1,121 @@
+# flip finetune, rollout 손실 없음 — Train/finetune.py
+#
+# 근거(2026-08-19): roll은 rollout에는 유효했으나(RolloutBestVal 2.18 vs 무roll 3.36, 1.54×)
+#   유일한 사망 원인이었다 — roll-only NaN → 전 항 NaN → ep218 이후 582에폭 낭비.
+#   판정 지표인 window_scale 결합은 one-shot(τ≤0.1)이라 rollout이 기여하지 않는다.
+#   따라서 티처포싱 전용으로 800에폭을 온전히 쓴다. rollout은 평가로만 계속 찍는다.
+
+[run]
+name = "_ft_adapter_noroll"
+
+[train]
+adapter_only      = true   # flip_adapters만 학습, 나머지 동결 (2026-08-17): 게이트는 출력만 막고
+                           # flip gradient는 trunk를 통과 → nonflip 결합 0.53×→1.62× 드리프트.
+                           # 동결로 구조 차단. 판정 지표는 window_scale_probe nonflip 0.53× 복구.
+max_epochs        = 800
+steps_per_segment = 5      # 세그먼트 20 (march_dt 0.25) — 에폭당 100 step 유지
+max_cases         = 8000
+ic_max_n          = 1024   # IC 항 스텝당 케이스 상한 (0=전체). 전체는 8000×10세그=8만행 — pretrain과
+                           # 같은 이유로 순수 낭비다. // [[ic-term-dominates-step]]
+n_val             = 2000
+n_colloc_cases    = 8000
+replay_frac       = 0.0    # 0.45 → 0.0 (2026-08-17): adapter_only에선 replay가 무의미 —
+                           # 드리프트는 동결이 구조적으로 차단하고, nonflip 행의 adapter gradient는
+                           # g≈0.006 스케일이라 살 게 없다. A/B 실측도 0.25→0.45가 드리프트에
+                           # ~15%만 유효, flip 티처포싱만 33% 후퇴 // [[rollout-tail-cauchy-tradeoff]]
+save_interval_sec = 1800
+warmup_epochs     = 2
+grad_balance_every = 10    # drift 트리거 부트스트랩용 (첫 스냅샷 전)
+grad_balance_batches = 3
+# pretrain과 같은 자동 주기. finetune은 roll_activate_epoch=10으로 초반에 체제가 급변하고
+# replay/mixed 교대(trap 6) 탓에 고정 주기가 더 안 맞는다 — 비교·스냅샷은 non-replay 에폭만 쓴다.
+grad_balance_drift = 0.69
+grad_balance_min_every = 2
+grad_balance_max_every = 25
+grad_scale_max    = 100.0
+val_interval      = 10
+rollout_interval  = 25
+rollout_cases     = 100
+extrap_cases      = 0
+save_rollout_best = true
+
+roll_robust_kind    = "huber"  # Cauchy → Huber (2026-08-17): Cauchy가 tail gradient를 c/l로
+                               # 끊어 flip 평균 악화 + ep429~767 NaN skip 64회로 rollout이
+                               # 후반 내내 죽어 있었다. Huber는 √(δ/l) 감쇠로 방향 신호 보존.
+roll_activate_epoch = 10
+roll_ramp_epochs    = 80
+roll_cases          = 0    # 0 → roll_enabled False (loop_common). λ_roll도 0으로 같이 내려 둔다.
+roll_depth_max      = 16   # 초 단위 지평 유지: 8×0.5s → 16×0.25s = 4s (상한 n_win-1 = 19)
+roll_points         = 12
+
+[net]
+fourier_l = 32
+f_min     = 0.2
+f_max     = 20.0
+width     = 384
+n_blocks  = 6
+param_embed_dim = 32
+cond_mode   = "film"   # pretrain(2026_08_18_12_58_30)과 반드시 일치 — trunk 입력/파라미터 집합이 다르다.
+                       # energy_gate 추가 열(cond 38→39)은 _AdaptState zero-pad로 흡수 = 순수 증분.
+film_hidden = 128
+hard_ic          = "c1"   # pretrain ckpt와 **반드시 일치**해야 한다 — 파라미터 shape은 같지만
+                          # 헤드 출력의 의미(A_θ/A_ω 계수 vs 절대 Δθ/ω)가 달라 조용히 어긋난다.
+energy_gate      = true
+flip_adapter_dim = 128
+flip_adapter_n   = 2
+gate_sparse      = true
+gate_eps         = 0.05
+
+[optimizer]
+lr            = 1e-5
+weight_decay  = 1e-4
+grad_clip     = 1.0
+
+[ode_scheduler]
+# rel_tol_* = 에폭당 개선율 하한, patience_* = 에폭 단위 (근거는 Train/config.toml)
+# 측정 주기: val 10 / roll 25. ext 게이트는 extrap_cases = 0이라 미측정 → veto 불참.
+# phys 트래커(ema_beta/rel_tol) 제거 — patience는 decay 시도 간격(에폭). 실효 동작 동일.
+patience        = 60
+factor          = 0.75
+min_lr          = 1e-6
+max_veto_epochs = 40
+rel_tol_val     = 4e-4
+rel_tol_roll    = 4e-4
+patience_val    = 30      # 3측정 × 10에폭
+patience_roll   = 25      # 정체 측정 1회면 개방 (rollout_interval 25)
+ema_beta_val    = 0.9
+ema_beta_roll   = 0.8
+
+[lambda]
+ic      = 1.0
+data    = 1.0
+kin     = 1.0
+phys    = 1.0
+energy  = 0.8
+roll    = 0.0   # roll_cases=0과 이중 안전장치 — roll_enabled는 둘의 AND
+# ReLoBRaLo 제거(2026-07-31) — 위 값이 곧 고정 base 가중치 (유효 가중치 = λ × grad_scale × ramp)
+
+[colloc]
+n_colloc          = 20480      # colloc_chunk(4096)의 5배수 — 나머지 청크가 없어 컴파일 그래프 1개.
+                               # 2026-07-31: pretrain과 동일 상향. 단 flip은 1024점에서 이미 40960의 63%를
+                               # 회수하므로(nonflip은 40960에도 미포화) 여기 증량분은 사실상 nonflip 몫이다.
+                               # colloc_flip_bias 재검토가 별건으로 남아 있다. // [[colloc-gradient-is-noisiest-term]]
+n_colloc_cases    = 8000
+colloc_flip_bias  = 0.5
+ic_sigma          = 0.03
+ic_sigma_warmup   = 100
+
+[data]
+g            = 9.81
+t_data_max   = 5.0
+march_dt     = 0.25    # pretrain(2026_08_18_12_58_30)과 반드시 동일 — 다르면 t_norm 정규화와
+                       # RFF 위상 기준이 어긋나 로드한 가중치가 무의미해진다
+energy_eps   = 0.01
+phys_eps     = 10.0    # pretrain과 동일(2026-08-01 eps 스윕 근거 이관) — 1.0이던 구 값은 stale.
+                       # loss 스케일 ~12배 차이라 이전 finetune 런과 AvgLoss_ODE 직접 비교 불가.
+batch_size   = 4096
+colloc_chunk = 4096            # pretrain과 동일 — 2026-07-31에 2048에서 상향. 미지정 시 batch_size(4096)로
+                               # 떨어지지만 명시해 둔다 (batch_size가 바뀌어도 물리 청크는 고정)
+nonflip_path = "data/nonflip_RK4_0_5s.npy"
+data_path    = "data/mixed_RK4_0_5s_25flip.npy"
+scaler_name  = "scaler.npy"

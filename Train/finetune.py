@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import shutil
-import time
 from pathlib import Path
 import sys
 
@@ -85,6 +84,8 @@ def Finetune(
     trainer.active_cases = trainer.train_pool[: trainer.max_cases]
 
     pretrain_step = trainer.LoadWeights(ckpt_path)
+    if train_cfg.adapter_only:
+        trainer.FreezeToAdapters()
     trainer.SetOptimizerAdamW()
 
     tqdm.write(
@@ -119,7 +120,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="extrap", choices=list(_CKPT_FILES),
                         help="불러올 pretrain 체크포인트")
     parser.add_argument("--config", type=str, default=None,
-                        help="config 경로 (기본: Train/config_finetune.toml)")
+                        help="config 경로 (기본: Train/config_finetune_noroll.toml)")
     parser.add_argument("--out", type=str, default=None, help="결과 저장 폴더")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--max_epochs", type=int, default=None, help="에폭 수 오버라이드 (스모크용)")
@@ -128,7 +129,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_val", type=int, default=None)
     args = parser.parse_args()
 
-    cfg = args.config or str(Path(__file__).parent / "config_finetune.toml")
+    cfg = args.config or str(Path(__file__).parent / "config_finetune_noroll.toml")
     if args.out is None:
         _, _, _, _, t_params, _ = LoadConfig(cfg)
         run_name = t_params.get("name", "_ft_adapter")

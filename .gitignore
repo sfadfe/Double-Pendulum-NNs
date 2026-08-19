@@ -7,7 +7,7 @@ model/
 CLAUDE.md
 double_pendulum_pinns_design.md
 offer.txt
-config.toml
+Train/config.toml
 config_copy.toml
 sweeps/
 double_pendulum_pinns.md
@@ -15,5 +15,16 @@ Test/
 Sweep/
 .gitignore
 md/
+
 CLAUDE.md
-.cursor/    
+.cursor/
+*.log
+
+md/
+
+Train/*_probe.py
+Train/film_ab.sh
+
+scripts/omen-linux-tuning/*.sh
+scripts/omen-linux-tuning/logs/
+Train/probe_common.py

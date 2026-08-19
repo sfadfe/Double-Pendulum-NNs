@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 from Train.loop_common import BuildExtrapGT, EvalPrecision, SelectRolloutCases
-from Train.tf_profile_probe import BuildTrainer, FrameErrors
+from Train.probe_common import BuildTrainer, FrameErrors
 
 TARGET = 1.0e-3
 

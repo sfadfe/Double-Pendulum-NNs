@@ -52,29 +52,6 @@ class Dataset:
     def _ActiveSource(self):
         return self.data, self.params_raw
 
-    def StratifiedValSplit(self, n_val, seed=42):
-        # Shuffle while keeping flip fraction in val // is_flip 비율 유지 검증 분할
-        if self.is_flip is None:
-            raise RuntimeError("StratifiedValSplit requires is_flip metadata")
-        n_val = min(int(n_val), self.n_case - 1)
-        rng = np.random.default_rng(seed)
-        flip_idx = torch.where(self.is_flip)[0].cpu().numpy()
-        nf_idx = torch.where(~self.is_flip)[0].cpu().numpy()
-        rng.shuffle(flip_idx)
-        rng.shuffle(nf_idx)
-        flip_frac = float(self.is_flip.float().mean())
-        n_vf = min(len(flip_idx), max(1, int(round(flip_frac * n_val))))
-        n_vnf = min(len(nf_idx), n_val - n_vf)
-        n_vf = min(len(flip_idx), n_val - n_vnf)
-        val_np = np.concatenate([flip_idx[:n_vf], nf_idx[:n_vnf]])
-        rng.shuffle(val_np)
-        val_idx = torch.tensor(val_np, dtype=torch.long, device=self.device)
-        mask = torch.ones(self.n_case, dtype=torch.bool, device=self.device)
-        mask[val_idx] = False
-        self.val_cases = val_idx
-        self.train_pool = torch.where(mask)[0]
-        return len(self.val_cases), len(self.train_pool)
-
     def ComputeScaler(self, scaler_dir, extra_omega_paths=None):
         # log z-score for m, L over training pool (design 2.4 #3) // 로그 후 z-score
         log_p = torch.log(self.params_raw.double())               # (N, 4)
@@ -127,7 +104,27 @@ class Dataset:
         omega = ic_state[:, [1, 3]] / self.omega_rms
         pn = self.NormParams(params_raw)
         p_emb = self.param_embed(pn)  # Networks.ParamEmbed // option B3
-        return torch.cat([tau, trig, omega, p_emb], dim=1)
+        parts = [tau, trig, omega, p_emb]
+        if self.netCfg.energy_gate:
+            parts.append(self._EnergyGate(ic_state, params_raw).to(p_emb.dtype))
+        return torch.cat(parts, dim=1)
+
+    @torch.no_grad()
+    def _EnergyGate(self, ic_state, params_raw):
+        # log(e_rel / e_flip) — state/states.py:62-77의 라벨 생성 기준과 동일한 장벽 비
+        #   is_flip은 관측이 아니라 이 비로 '정의'된 라벨: flip은 >1, nonflip은 <0.6이고
+        #   [0.6, 1.0] 밴드는 샘플링에서 버려져 실측 0건 → 완전 간격 분리(정확도 1.000).
+        #   log를 취해 장벽에서 0-중심 + 상단 23배 꼬리 압축. E는 윈도우 보존량 = 케이스 상수라
+        #   τ 무관 → Loss.StateDerivs의 jvp 불변. // [[flip-label-is-energy-defined]]
+        p = params_raw.double()
+        m1, m2, L1, L2 = p[:, 0], p[:, 1], p[:, 2], p[:, 3]
+        v_min = -self.g * ((m1 + m2) * L1 + m2 * L2)     # 전 배위 최소 위치에너지
+        e_rel = self.GetEnergy(ic_state.double(), p) - v_min
+        e_flip = torch.minimum(
+            2.0 * self.g * m2 * L2, 2.0 * self.g * L1 * (m1 + m2)
+        )
+        log_ratio = torch.log(e_rel.clamp_min(1e-12) / e_flip)
+        return log_ratio.unsqueeze(1)
 
     def _WindowStartIdx(self, t_lo):
         # grid index of the window start time // 윈도우 시작 시점의 격자 인덱스
@@ -189,11 +186,6 @@ class Dataset:
         )
         return feats, frame["theta_true"][idx], frame["omega_true"][idx]
 
-    def SegmentSamples(self, t_lo, t_hi):
-        frame = self.SegmentFrame(t_lo, t_hi)
-        feats = self._BuildFeats(frame["tau"], frame["params"], frame["ic_flat"])
-        return feats, frame["theta_true"], frame["omega_true"], frame["params"]
-
     def ICSamplesRaw(self, max_n=None):
         # IC raw tensors without param_embed // param_embed 없는 IC raw (청크별 feats 생성용)
         data, _ = self._ActiveSource()
@@ -222,16 +214,3 @@ class Dataset:
                 "omega0": ic_state[:, [1, 3]],
             })
         return parts
-
-    def ICSamples(self, max_n=None):
-        parts = self.ICSamplesRaw(max_n=max_n)
-        feats_list, theta_list, omega_list = [], [], []
-        for part in parts:
-            feats_list.append(self._BuildFeats(part["tau"], part["params"], part["ic_state"]))
-            theta_list.append(part["theta0"])
-            omega_list.append(part["omega0"])
-        feats = torch.cat(feats_list, dim=0)
-        theta0 = torch.cat(theta_list, dim=0)
-        omega0 = torch.cat(omega_list, dim=0)
-        params = parts[0]["params"].repeat(len(self.segments))
-        return feats, theta0, omega0, params

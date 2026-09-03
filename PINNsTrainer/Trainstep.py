@@ -433,7 +433,7 @@ class TimeMarching:
         # off-manifold IC 섭동 (Phase 3, 에폭 램프) // ic_sigma 램프
         sigma = getattr(self, "_colloc_ic_sigma", 0.0)
         ic_state = ic_base + sigma * torch.randn_like(ic_base) if sigma > 0.0 else ic_base
-        e0 = self.GetEnergy(ic_state.double(), params.double()).detach()
+        e0 = self.GetEnergy(ic_state.float(), params.float()).detach()   # 2026-08-30: FP32 (Loss.py 주석)
         return {"tau": tau, "ic_state": ic_state, "params": params, "e0": e0}
 
     def SetupCollocCases(self, n_colloc=None, flip_bias=0.0):
@@ -528,4 +528,16 @@ class TimeMarching:
         tau_flat = tau.repeat(n, 1)
         ic_flat = state.repeat_interleave(p, dim=0)
         feats = self._BuildFeats(tau_flat, params_flat, ic_flat)
-        return self(feats).reshape(n, p, 4)
+        return self._RollForward(feats, p)
+
+    def _RollForward(self, feats, n_points):
+        # Window forward for case-major rows (n·P): FiLM once per case, expanded to P rows.
+        # 같은 케이스의 P점은 cond가 동일한데 행마다 계산하면 cond MLP(트렁크와 같은 FLOP)가 P배 중복.
+        # compile 단위 — feats 생성(gather)은 밖. // 케이스별 FiLM 1회 + compile (2026-08-31)
+        return self._Compiled("roll", self._RollForwardImpl)(feats, n_points)
+
+    def _RollForwardImpl(self, feats, n_points):
+        n = feats.shape[0] // n_points
+        cond = tuple(c.repeat_interleave(n_points, dim=0)
+                     for c in self.CondOf(feats[::n_points]))      # 케이스 대표행 (case-major)
+        return self(feats, cond=cond).reshape(n, n_points, 4)

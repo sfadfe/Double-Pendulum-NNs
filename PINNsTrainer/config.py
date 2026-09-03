@@ -16,7 +16,7 @@ class NetCfg:
     ic_feat_dim: int = 6      # 4 trig(θ0) + 2 ω(0) // raw m/L 제외 (ParamEmbed로 대체)
     param_embed_dim: int = 32 # ParamEmbed 출력 차원 // option B3
     width: int = 384          # hidden layer width // 은닉층 너비 (M tier)
-    n: int = 6                # ResidualBlock count // 잔차 블록 수
+    n: int = 6                # FiLMBlock count // 잔차 블록 수
 
     # flip 조건화 실험 (2026-07-30): IC 에너지가 θ2 반전 임계를 넘는 여유분을 입력에 명시.
     #   E는 trig(θ0)·ω0·param_embed로 이미 결정되므로 정보 추가가 아니라 feature engineering —
@@ -31,17 +31,9 @@ class NetCfg:
     #   구조 변경이라 체크포인트 비호환 — 값을 바꾸면 fresh pretrain이 필요하다.
     hard_ic: str = "c1"
 
-    # 조건화 방식 (2026-08-02) // 케이스(IC·params)가 trunk에 들어가는 경로
-    #   "concat" — 종전. (τ features, IC, param_embed)를 한 벡터로 붙여 proj_u/v/in에 넣는다.
-    #              케이스는 매 블록 u·v로 재주입되지만 **덧셈**이라 τ-함수를 평행이동만 시킨다.
-    #   "film"   — trunk 입력은 τ features뿐. 케이스는 별도 MLP를 타고 블록마다 (γ, β)를 만들어
-    #              h ← γ·h + β로 **곱셈 변조**한다 → 케이스가 τ-함수의 모양 자체를 고른다.
-    #              근거: fourier_l 32→64 A/B가 기저를 3.3배 늘려도 오차가 τ 안에서 재배분만
-    #              됐다 = 기저 부족이 아니라 케이스별 재배분 능력 부족. 그리고 창끝 오차가
-    #              진폭(+0.28)보다 국소 곡률/빠른 시간상수(+0.50)와 더 상관한다.
-    #   비용: FiLM은 **케이스당 1회**라 τ점 N개를 뽑는 롤아웃에서 추론 비용이 거의 안 는다
-    #   (width 증량이 τ점마다 2.6배인 것과 반대). 구조 변경이라 체크포인트 비호환 — fresh 전용.
-    cond_mode: str = "film"
+    # 조건화 (확정 2026-08-31): trunk 입력은 τ features뿐, 케이스(IC·param_embed)는 FiLMCond를
+    #   타고 블록마다 (γ, β)로 잔차 가지를 곱셈 변조한다 (networks.FiLMBlock). concat 경로·gated 블록·
+    #   τ 재주입은 A/B에서 기각되어 코드에서 제거됐다 — 옵션 아님.
     film_hidden: int = 128    # 조건화 MLP 은닉폭. 출력은 2·width·n (블록당 γ, β)
 
     # flip 전용 용량 (2026-07-30): energy gate로 켜지는 bottleneck adapter.
@@ -79,8 +71,8 @@ class NetCfg:
 
     @property
     def trunk_in_dim(self) -> int:
-        # film이면 trunk는 τ만 받는다 — 케이스는 γ·β로만 들어온다
-        return 2 * self.fourier_l + 1 if self.cond_mode == "film" else self.gx_dim
+        # trunk는 τ만 받는다 — 케이스는 γ·β로만 들어온다
+        return 2 * self.fourier_l + 1
 
 
 @dataclass
@@ -214,7 +206,6 @@ def LoadConfig(path):
         param_embed_dim=n.get("param_embed_dim", 32),
         energy_gate=n.get("energy_gate", False),
         hard_ic=n.get("hard_ic", "c1"),
-        cond_mode=n.get("cond_mode", "film"),
         film_hidden=n.get("film_hidden", 128),
         flip_adapter_dim=n.get("flip_adapter_dim", 0),
         flip_adapter_n=n.get("flip_adapter_n", 2),

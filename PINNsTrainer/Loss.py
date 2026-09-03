@@ -37,12 +37,25 @@ class Loss:
         # // FP32 jvp로 FP32 코어 활용 (검증: domega/dt floor 1.8e-5 << 잔차 O(100)). AngularAccel/GetEnergy만 FP64 유지
         t = feats[:, 0:1].float()
         rest = feats[:, 1:].float()
-        ones = torch.ones_like(t)
+        # FiLM (γ, β) outside the jvp (2026-08-31): it depends on case columns only, so its τ-tangent
+        # is identically 0 — but jvp would still push a materialized zero tangent through the cond
+        # MLP (128 → 2·n_blocks·width: as many MACs as the whole trunk) and autograd would then
+        # differentiate that dead tangent path too. Compute it once here and hand it in as a primal
+        # with an explicit zero tangent — closure capture would give it a lazy ZeroTensor tangent
+        # (trap 27). Same math: γ·SiLU(·) tangent = γ_t·SiLU + γ·SiLU'·pre_t with γ_t = 0.
+        # // FiLM은 jvp 밖에서 1회, 0-tangent를 명시해 primal로 전달 (수학 동일, 죽은 경로 제거)
+        # β = gb[:, :, 1] is a non-dense view; forward AD requires primal and tangent to share a
+        # layout through view ops (unbind) — contiguous copy (N·n·width, memory-bound, ~0.1 ms).
+        # // primal/tangent 레이아웃 불일치 → forward-AD 뷰 연산 assert. contiguous로 통일
+        cond = tuple(c.contiguous() for c in self.CondOf(feats.float()))
 
-        def f(tc, rc):                                    # (M, 1), (M, F-1) -> ((M,2), (M,2))
+        def f(tc, rc, *cd):                               # (M, 1), (M, F-1), γ, β -> ((M,2), (M,2))
             x = torch.cat([tc, rc], dim=1)
-            out = self(x)                                 # (M, 4) [θ1, θ2, ω1, ω2]
+            out = self(x, cond=cd)                        # (M, 4) [θ1, θ2, ω1, ω2]
             return out[:, :2], out[:, 2:]                 # theta, omega
+
+        primals = (t, rest) + cond
+        tangents = tuple(torch.ones_like(t) if i == 0 else torch.zeros_like(v) for i, v in enumerate(primals))
 
         # single jvp // d/dt [θ, ω] = [dθ/dt, dω/dt]
         # rest is a primal with an explicit zero tangent, not a closure capture: closure
@@ -53,9 +66,7 @@ class Loss:
         # 죽는다(finetune adapter 그래프에서만 발현). 명시적 0 tangent로 우회 — 수학적 동일.
         # weight tangent 경유의 두 번째 크래시 경로는 _Compiled의 allow_buffer_reuse=False가
         # 막는다 — 둘 다 필요하다 (trap 27).
-        (theta, omega), (dtheta_dt, domega_dt) = tf.jvp(
-            f, (t, rest), (ones, torch.zeros_like(rest))
-        )
+        (theta, omega), (dtheta_dt, domega_dt) = tf.jvp(f, primals, tangents)
         return theta, omega, dtheta_dt, domega_dt
 
     def _KinTerm(self, omega, dtheta_dt):
@@ -103,12 +114,15 @@ class Loss:
         theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
         l_kin = self._KinTerm(omega, dtheta_dt)
 
+        # 2026-08-30: FP64 → FP32. FP64는 trunk에 없었고 여기(EOM·에너지)만 썼는데 비용 ≈ 0이라
+        #   두었던 것. 목표 상대잔차 1e-3~1e-5 대비 fp32 반올림 6e-8×상쇄 증폭은 여유가 2자리 이상
+        #   → 정확도 기대 변화 0, FP64-free 학습·추론 경로 통일이 목적. 변수명 *64는 그대로 둔다.
         with torch.autocast(device_type=self.device_type, enabled=False):
-            p64 = params.double()
-            e0_64 = e0.double()
-            th64 = ic_theta.double() + theta.double()
-            om64 = omega.double()
-            dom64 = domega_dt.double()
+            p64 = params.float()
+            e0_64 = e0.float()
+            th64 = ic_theta.float() + theta.float()
+            om64 = omega.float()
+            dom64 = domega_dt.float()
             f_eom = self.AngularAccel(
                 th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1], p64
             )
@@ -148,16 +162,78 @@ class Loss:
         n_draws = max(1, int(getattr(self.trainCfg, "roll_draws", 1)))
         if n_draws == 1 or case_idx.shape[0] < 2 * n_draws:
             return self._RobustRollMean(self._RolloutPerCase(case_idx, depth, n_points))
+        return self._RobustRollMean(self._RolloutMergedDraws(case_idx, n_draws, n_points))
+
+    def _RolloutMergedDraws(self, case_idx, n_draws, n_points):
+        # All draws in one batch (2026-08-31). Per-draw (k0, depth) become per-case vectors; the
+        # pushforward runs max(depth) rounds over every case and freezes a case (torch.where) once
+        # its own depth is reached. Rows are independent through the network, so each case sees
+        # exactly the sequential-draw computation — only the batch it shares changes.
+        # Sequential draws launched Σdepth (~40) tiny eager forwards per step = 22% of the step;
+        # this is max(depth) (~15) compiled ones plus one grad window with per-case FiLM.
+        # // draw 순차 → 단일 배치: 케이스별 depth/k0 벡터 + where 고정. 수학 동일, 런치 수 Σ→max
+        dev = self.device
+        md = self.dataCfg.march_dt
+        dt = self.dt
         n_win = len(self.segments)
-        outs = []
+        depth_c, k0_c, max_depth = [], [], 0
         for j, chunk in enumerate(case_idx.chunk(n_draws)):
             if chunk.numel() == 0:
                 continue
             # k0를 윈도우 축으로 stratify — uniform 추첨이면 draw를 늘려도 같은 구간에 몰린다
             d_j = max(1, min(self.RollDepth(), n_win - 1))
             k0_j = min((j * n_win) // n_draws, n_win - d_j - 1)
-            outs.append(self._RolloutPerCase(chunk, d_j, n_points, k0=k0_j))
-        return self._RobustRollMean(torch.cat(outs))
+            depth_c.append(torch.full((chunk.numel(),), d_j, device=dev, dtype=torch.long))
+            k0_c.append(torch.full((chunk.numel(),), k0_j, device=dev, dtype=torch.long))
+            max_depth = max(max_depth, d_j)                        # python int — host sync 없음
+        depth_c = torch.cat(depth_c)
+        k0_c = torch.cat(k0_c)
+
+        data, _ = self._ActiveSource()
+        ci = case_idx.cpu() if data.device != self.device else case_idx
+        i0_c = torch.round(k0_c.double() * md / dt).long()          # _RolloutPerCase의 int(round(k0*md/dt))
+        state = data[ci, i0_c.to(ci.device)][:, [1, 2, 3, 4]]
+        if state.device != self.device:
+            state = state.to(self.device)
+        params = self._ParamsAt(case_idx)
+
+        tau_end = torch.full((1, 1), md, device=dev)
+        alive = depth_c.unsqueeze(1)                               # (n,1) — round t 진행 조건 depth > t
+        with torch.no_grad():
+            for t in range(max_depth):
+                out = self._RollWindow(case_idx, params, state, tau_end)   # (n,1,4) [Δθ,ω]
+                last = out[:, -1, :]
+                th_abs = state[:, [0, 2]] + last[:, :2]
+                nxt = torch.stack([th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1)
+                state = torch.where(alive > t, nxt, state)         # depth를 다 쓴 케이스는 고정
+        state = state.detach()
+
+        kg_c = k0_c + depth_c
+        i_start_c = torch.round(kg_c.double() * md / dt).long()
+        n_seg = int(round(md / dt))                                # 윈도우 격자 길이 — 전 케이스 동일
+        off = torch.arange(1, n_seg + 1, device=dev)               # exclude τ=0, include end
+        if off.numel() > n_points:
+            sel = torch.linspace(0, off.numel() - 1, n_points, device=dev).round().long()
+            off = off[sel]
+        p = off.numel()
+        grid = i_start_c.unsqueeze(1) + off.unsqueeze(0)           # (n,P)
+        tau = (self.t_grid[grid] - self.t_grid[i_start_c].unsqueeze(1)).reshape(-1, 1).float()
+
+        feats = self._BuildFeats(
+            tau, params.repeat_interleave(p, dim=0), state.repeat_interleave(p, dim=0)
+        )
+        out = self._RollForward(feats, p)                          # (n,P,4) with grad, 케이스별 FiLM
+        theta_pred = state[:, [0, 2]].unsqueeze(1) + out[:, :, :2]
+        omega_pred = out[:, :, 2:]
+        grid_idx = grid.cpu() if data.device != self.device else grid
+        seg = data[ci.unsqueeze(1), grid_idx]                      # (n,P,5)
+        if seg.device != self.device:
+            seg = seg.to(self.device)
+        theta_true = seg[:, :, [1, 3]]
+        omega_true = seg[:, :, [2, 4]]
+        return ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
+            (omega_pred - omega_true) ** 2
+        ).mean(dim=(1, 2))
 
     def _RolloutPerCase(self, case_idx, depth, n_points, k0=None):
         # Pushforward (Brandstetter+ 2022): roll `depth` windows under no_grad to reach the

@@ -52,7 +52,7 @@ def Finetune(
     if n_val is not None:
         t_params["n_val"] = n_val
 
-    if seed is not None:
+    if seed is not None:   # fixed seed: rollout val scale can differ ~2× across seeds (2026-09-01) // 시드마다 RolloutVal 스케일이 2배까지 달라질 수 있어 고정
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 

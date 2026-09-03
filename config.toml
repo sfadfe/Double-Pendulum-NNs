@@ -1,10 +1,10 @@
 [run]
-name = "_pretrain_film_md025"
+name = "_pretrain_256x12_film"
 
 [train]
-max_epochs        = 10000
+max_epochs        = 3100
 steps_per_segment = 5
-max_cases         = 30000
+max_cases         = 65000
 ic_max_n          = 1024
 n_val             = 5000
 save_interval_sec = 1800
@@ -22,6 +22,7 @@ rollout_cases     = 100
 extrap_cases      = 50
 extrap_t_ext      = 8.0
 extrap_rk4_dt     = 1.0e-4
+
 roll_robust_kind    = "huber"
 roll_activate_delay = 200
 roll_ramp_epochs    = 150
@@ -31,10 +32,13 @@ roll_points         = 12
 roll_depth_ramp_epochs = 25
 roll_draws          = 4
 roll_median_ema     = 0.9
+
 kin_ramp_epochs   = 40
 ema_decay         = 0.999
+
 phys_ramp_center  = 30
 phys_ramp_width   = 10
+
 lr_drop_epoch     = 55
 lr_drop_to        = 1.0e-4
 
@@ -42,10 +46,12 @@ lr_drop_to        = 1.0e-4
 fourier_l = 32
 f_min     = 0.2
 f_max     = 20.0
-width     = 384
-n_blocks  = 6
+width     = 256
+n_blocks  = 12
 param_embed_dim = 32
 film_hidden = 128
+
+hard_ic   = "c1"
 
 [optimizer]
 lr            = 1e-3
@@ -54,8 +60,8 @@ grad_clip     = 1.0
 
 [ode_scheduler]
 patience        = 80
-factor          = 0.75
-min_lr          = 1e-6
+factor          = 0.8
+min_lr          = 5e-6
 phase2_lr       = 5.0e-4
 max_veto_epochs = 160
 rel_tol_val     = 4e-4
@@ -89,6 +95,6 @@ energy_eps   = 0.01
 phys_eps     = 10.0
 batch_size   = 16384
 colloc_chunk = 4096
-nonflip_path = "data/nonflip_RK4_0_5s.npy"
+nonflip_path = "data/nonflip_RK4_0_5s_70k.npy"
 scaler_name  = "scaler.npy"
 scaler_extra_omega = "data/mixed_RK4_0_5s_25flip.npy"

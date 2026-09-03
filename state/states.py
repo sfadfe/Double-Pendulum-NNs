@@ -109,10 +109,13 @@ def GenerateIcPool(n_flip, n_nonflip, flip_path=None, nonflip_path=None):
     return n_f, n_g
 
 
-def BuildNonflip():
-    n_gen = max(int(N_TOTAL * OVERSAMPLE_NF), N_TOTAL + 50)
-    print(f"[states] mode=nonflip  n_total={N_TOTAL}  ic_lines={n_gen}")
-    GenerateIcPool(0, n_gen, nonflip_path=PATHS["nonflip"])
+def BuildNonflip(n_total=N_TOTAL, out_path=None):
+    # n_total/out_path override for extra corpora (case-count lever) // 케이스 증량용 추가 코퍼스
+    #   기본값은 종전 동작(data/states.txt, 35000)과 동일 — 기존 파일을 덮지 않으려면 --out 필수.
+    n_gen = max(int(n_total * OVERSAMPLE_NF), n_total + 50)
+    out_path = PATHS["nonflip"] if out_path is None else Path(out_path)
+    print(f"[states] mode=nonflip  n_total={n_total}  ic_lines={n_gen}  out={out_path}")
+    GenerateIcPool(0, n_gen, nonflip_path=out_path)
 
 
 def BuildMixed():
@@ -139,9 +142,14 @@ def Main():
         "mode", choices=["nonflip", "mixed"],
         help="nonflip=pretrain, mixed=finetune",
     )
+    parser.add_argument("--n_total", type=int, default=N_TOTAL, help="nonflip only")
+    parser.add_argument("--out", type=str, default=None, help="nonflip only: IC file path")
+    parser.add_argument("--seed", type=int, default=None, help="np.random seed (reproducible IC draw)")
     args = parser.parse_args()
+    if args.seed is not None:
+        np.random.seed(args.seed)
     if args.mode == "nonflip":
-        BuildNonflip()
+        BuildNonflip(n_total=args.n_total, out_path=args.out)
     else:
         BuildMixed()
 

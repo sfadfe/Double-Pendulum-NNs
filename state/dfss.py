@@ -145,20 +145,23 @@ def StratifiedValSplitIdx(is_flip, n_val):
     return val_idx, np.where(mask)[0]
 
 
-def BuildNonflip():
+def BuildNonflip(n_total=N_TOTAL, states_path=None, out_path=None):
+    # Overrides for extra corpora (case-count lever) // 케이스 증량용 추가 코퍼스 — 기본값은 종전 동작
     paths = PATHS["nonflip"]
-    print(f"[dfss] mode=nonflip  n_total={N_TOTAL}")
-    RunSimulation(False, paths["states"], paths["out"])
+    states_path = paths["states"] if states_path is None else Path(states_path)
+    out_path = paths["out"] if out_path is None else Path(out_path)
+    print(f"[dfss] mode=nonflip  n_total={n_total}  states={states_path}  out={out_path}")
+    RunSimulation(False, states_path, out_path)
 
-    data = np.load(paths["out"], mmap_mode="r")
-    if data.shape[0] < N_TOTAL:
+    data = np.load(out_path, mmap_mode="r")
+    if data.shape[0] < n_total:
         raise RuntimeError(
-            f"nonflip: got {data.shape[0]} trajectories, need {N_TOTAL} — "
+            f"nonflip: got {data.shape[0]} trajectories, need {n_total} — "
             f"re-run state/states.py nonflip"
         )
-    trimmed = np.array(data[:N_TOTAL], dtype=np.float32)
-    np.save(paths["out"], trimmed)
-    print(f"[dfss] saved {trimmed.shape} -> {paths['out']}")
+    trimmed = np.array(data[:n_total], dtype=np.float32)
+    np.save(out_path, trimmed)
+    print(f"[dfss] saved {trimmed.shape} -> {out_path}")
     return trimmed.shape
 
 
@@ -234,9 +237,12 @@ def Main():
         "mode", choices=["nonflip", "mixed"],
         help="nonflip=pretrain, mixed=finetune",
     )
+    parser.add_argument("--n_total", type=int, default=N_TOTAL, help="nonflip only")
+    parser.add_argument("--states", type=str, default=None, help="nonflip only: IC file")
+    parser.add_argument("--out", type=str, default=None, help="nonflip only: output .npy")
     args = parser.parse_args()
     if args.mode == "nonflip":
-        BuildNonflip()
+        BuildNonflip(n_total=args.n_total, states_path=args.states, out_path=args.out)
     else:
         BuildMixed()
 

@@ -8,14 +8,14 @@ import torch.nn as nn
 - time-marching flow map: τ는 윈도우 내 상대시간(τ∈[0, march_dt]), trig/ω는 윈도우 시작 상태(IC)
 - τ는 Fourier Features(물리 주파수, Hz)로 매핑되고, 또한 [0, march_dt]에서 [-1, 1]로 정규화됨
 - 출력: (N, 4) = [Δθ1, Δθ2, ω1, ω2]. Δθ = θ(τ) − θ_IC (상대각), ω는 절대값.
-  공유 trunk + head_theta / head_omega 분리 // option B1
+  공유 trunk(FiLMBlock 스택, 케이스는 FiLM (γ,β)로만 주입) + head_theta / head_omega 분리 // option B1
 """
 
 
 class FourierFeatures(nn.Module):
     # Fourier features on t  // 시간 t에 대해서만 fourier features 적용
     def __init__(self, fourier_l, f_min, f_max):
-        super().__init__() 
+        super().__init__()
         # f_k = f_min * (f_max/f_min)^(k/(L-1)), non-learnable NeRF Style // 고정 주파수 NeRF 방식 채택
         exponent = torch.linspace(0.0, 1.0, fourier_l)
         freqs = f_min * (f_max / f_min) ** exponent
@@ -62,15 +62,19 @@ class FiLMCond(nn.Module):
         return gamma, beta
 
 
-class ResidualBlock(nn.Module):
+class FiLMBlock(nn.Module):
+    # FiLM-inside residual block (2026-08-30, 확정 2026-08-31) // 변조가 잔차 가지 안에만 들어가는 블록
+    #   h ← h + γ(c)·SiLU(W h + b) + β(c). skip 경로는 변조되지 않는다.
+    #   구 gated 블록((1−z)u + zv + h 뒤 γ·h + β)은 skip까지 γ가 곱해져 깊이만큼 γ가 곱셈 증식했다.
+    #   여기선 γ가 가지 하나에만 걸려 블록 야코비안이 I + O(γ)로 유계 → 좁고 깊게(256×12) 쌓는다.
+    #   판정: FiLM-inside 256×12 > gated 384×6 (rollout 3.2×); τ 재주입(film_tau)은 3.9× 악화로 기각.
     def __init__(self, hidden):
         super().__init__()
         self.fc1 = nn.Linear(hidden, hidden)
-        self.act = nn.SiLU()  # option B2: Tanh → SiLU
+        self.act = nn.SiLU()
 
-    def forward(self, h, u, v):
-        z = self.act(self.fc1(h))
-        return (1.0 - z) * u + z * v + h  # U, V gating + residual connection 
+    def forward(self, h, gamma, beta):
+        return h + gamma * self.act(self.fc1(h)) + beta
 
 
 class FlipAdapter(nn.Module):
@@ -102,22 +106,13 @@ class Networks(nn.Module):
         self.fourier = FourierFeatures(netCfg.fourier_l, netCfg.f_min, netCfg.f_max)
         self.param_embed = ParamEmbed(netCfg.param_embed_dim)
 
-        self.cond_mode = netCfg.cond_mode  # "concat" | "film" — 케이스가 trunk에 들어가는 경로
-        gx = netCfg.trunk_in_dim           # film이면 τ features만
+        # Trunk gets τ features only; the case (IC, param_embed) enters solely through FiLM (γ, β).
+        # // trunk 입력은 τ뿐, 케이스는 FiLMCond → FiLMBlock 곱셈 변조로만 들어간다 (concat 경로 제거)
+        gx = netCfg.trunk_in_dim
         width = netCfg.width
-        self.proj_u = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
-        self.proj_v = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
         self.proj_in = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
-
-        self.film = None
-        if self.cond_mode == "film":
-            self.film = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, netCfg.n)
-        elif self.cond_mode != "concat":
-            raise ValueError(f"cond_mode must be 'concat' or 'film', got {netCfg.cond_mode!r}")
-
-        self.blocks = nn.ModuleList(
-            [ResidualBlock(width) for i in range(netCfg.n)]
-        )
+        self.film = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, netCfg.n)
+        self.blocks = nn.ModuleList([FiLMBlock(width) for i in range(netCfg.n)])
         self.head_theta = nn.Linear(width, 2)   # Δθ1, Δθ2 // option B1
         self.head_omega = nn.Linear(width, 2)   # ω1, ω2
 
@@ -154,26 +149,37 @@ class Networks(nn.Module):
             nn.init.zeros_(ad.up.weight)
             nn.init.zeros_(ad.up.bias)
 
-        # FiLM 출력도 zero-init → γ=1, β=0에서 출발 (Kaiming 루프 뒤여야 함)
-        #   시작점이 concat 팔과 같은 출발선이 되어 A/B가 초기화 차이에 오염되지 않는다
-        if self.film is not None:
-            nn.init.zeros_(self.film.net[-1].weight)
-            nn.init.zeros_(self.film.net[-1].bias)
+        # FiLMBlock 가지 1/√n 스케일 (Kaiming 루프 뒤). h + SiLU(Wh)는 Kaiming만으로는 블록마다
+        #   분산이 2배(12블록 = 실측 |out| 45×) → 가지를 1/√n으로 줄여 (1+1/n)ⁿ ≈ e로 유계화.
+        for b in self.blocks:
+            with torch.no_grad():
+                b.fc1.weight.mul_(1.0 / len(self.blocks) ** 0.5)
 
-    def forward(self, feats):
+        # FiLM 출력도 zero-init → γ=1, β=0에서 출발 (Kaiming 루프 뒤여야 함)
+        nn.init.zeros_(self.film.net[-1].weight)
+        nn.init.zeros_(self.film.net[-1].bias)
+
+    def CondOf(self, feats):
+        # FiLM (γ, β) for the rows of feats — (N, n_blocks, width) each. τ-independent
+        # (feats[:, 1:] only), so callers that evaluate many τ per case (rollout) or differentiate
+        # in τ (jvp) compute it once and pass it to forward(cond=).
+        # // FiLM 조건을 케이스 단위로 1회 계산해 forward(cond=)에 넘기기 위한 진입점
+        return self.film(feats[:, 1:])
+
+    def forward(self, feats, cond=None):
+        # cond: CondOf() 결과를 그대로 (N행 정렬) — None이면 여기서 행마다 계산 (기존 경로)
 
         tau = feats[:, 0:1] # relative time within window // 윈도우 내 상대시간
         emb_t = self.fourier(tau)  # (N, 2L)
         t_norm = 2.0 * tau / self.march_dt - 1.0
-        if self.cond_mode == "film":
-            x = torch.cat([emb_t, t_norm], dim=-1)             # (N, 2L+1) — trunk는 τ만
-            gamma, beta = self.film(feats[:, 1:])              # 케이스 → 블록별 (γ, β)
-        else:
-            x = torch.cat([emb_t, t_norm, feats[:, 1:]], dim=-1)  # (N, gx_dim)
-            gamma = beta = None
+        x = torch.cat([emb_t, t_norm], dim=-1)             # (N, 2L+1) — trunk는 τ만
+        gamma, beta = cond if cond is not None else self.film(feats[:, 1:])   # 케이스 → 블록별 (γ, β)
+        # unbind once: backward is a single stack. Indexing gamma[:, i] per block instead gave
+        # n_blocks SelectBackward nodes, each materializing a fresh (N, n_blocks, width) zero
+        # tensor to scatter into — ~7% of the step (profile 2026-08-31).
+        # // 블록별 슬라이스 대신 unbind 1회 — SelectBackward의 (N,n,width) 0-텐서 재생성 제거
+        gammas, betas = gamma.unbind(1), beta.unbind(1)
 
-        u = self.proj_u(x)
-        v = self.proj_v(x)
         h = self.proj_in(x)
 
         # flip gate: 마지막 열 log(e_rel/e_flip)을 [0,1]로 // 장벽 밴드 중앙에서 스위칭
@@ -188,10 +194,8 @@ class Networks(nn.Module):
                 idx = (g[:, 0].detach() > self.gate_eps).nonzero(as_tuple=True)[0]
 
         ad = 0
-        for i, block in enumerate(self.blocks):  # Pass all residual blocks through U and V gates. // 모든 residual block을 U, V 게이트에 통과시킴
-            h = block(h, u, v)
-            if gamma is not None:
-                h = gamma[:, i] * h + beta[:, i]   # FiLM: 케이스가 블록 출력을 곱셈 변조
+        for i, block in enumerate(self.blocks):
+            h = block(h, gammas[i], betas[i])          # FiLM이 잔차 가지 안에서만 변조
             if i in self.adapter_at:
                 h = self.flip_adapters[ad](h, g, idx)
                 ad += 1
@@ -217,4 +221,4 @@ class Networks(nn.Module):
             theta = s * (self.march_dt * w_ic + s * a_theta)
         else:
             theta = s * a_theta                 # c0: Δθ(0) = 0 만
-        return torch.cat([theta, omega], dim=-1)  # (N, 4) [Δθ1, Δθ2, ω1, ω2] 
+        return torch.cat([theta, omega], dim=-1)  # (N, 4) [Δθ1, Δθ2, ω1, ω2]

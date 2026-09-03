@@ -22,9 +22,10 @@ from Train.loop_common import (
 )
 
 
-def Train(MainFolderPath):
+def Train(MainFolderPath, cfg_path=None):
     base_dir = Path(__file__).parent.parent
-    cfg_path = Path(__file__).parent / "config.toml"
+    if cfg_path is None:   # default unchanged; sweeps pass their own // 스윕용 config 분리
+        cfg_path = Path(__file__).parent / "config.toml"
     net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
 
     shutil.copy(cfg_path, MainFolderPath / "config.toml")
@@ -112,14 +113,16 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default="latest", choices=_CKPT_FILES,
                         help="불러올 체크포인트 종류: latest / val / ode (기본: latest)")
     parser.add_argument("--lr", type=float, default=None, help="재시작 시 LR 덮어쓰기")
+    parser.add_argument("--config", type=str, default=None,
+                        help="fresh 런 config 경로 (기본 Train/config.toml). resume에는 무시 — 런 폴더의 config 사용")
     args = parser.parse_args()
 
     if args.resume:
         ckpt_path = Path(args.resume) / _CKPT_FILES[args.ckpt]
         Resume(ckpt_path, new_lr=args.lr, ckpt_name=args.ckpt)
     else:
-        cfg_path = Path(__file__).parent / "config.toml"
+        cfg_path = Path(args.config) if args.config else Path(__file__).parent / "config.toml"
         net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
         run_name = t_params.get("name", "")
         MainFolderPath = InitCkptDir(suffix=run_name)
-        Train(MainFolderPath)
+        Train(MainFolderPath, cfg_path=cfg_path)

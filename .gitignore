@@ -22,9 +22,12 @@ CLAUDE.md
 
 md/
 
-Train/*_probe.py
-Train/film_ab.sh
 
 scripts/omen-linux-tuning/*.sh
 scripts/omen-linux-tuning/logs/
-Train/probe_common.py
+
+# Train/: only the three loop files are tracked // 프로브·스윕 config·실험 스크립트는 로컬 전용
+Train/*
+!Train/finetune.py
+!Train/loop_common.py
+!Train/train.py

@@ -23,7 +23,7 @@ CSV_HEADER = [
     # 반드시 끝에만 추가할 것: ReadLogBests가 fieldnames=CSV_HEADER로 구 로그를 읽음 // append-only
     "Val_Flip", "ValOmega_Flip", "Val_NF", "ValOmega_NF",
     "Rollout_Flip", "RolloutOmega_Flip", "Rollout_NF", "RolloutOmega_NF",
-    # goal 1 판정 지표 (2026-08-01) — 평균이 1e-3이어도 seam에서 튀면 목표 미달이므로
+    # goal 1 판정 지표 — 평균이 1e-3이어도 seam에서 튀면 목표 미달이므로
     # 집계가 아니라 **per-τ 최대**로 판정한다. RollTauMax는 running min이 아닌 per-epoch 값.
     "RollTauMax", "RollTauArgmax", "RollSeamJump", "RollTauMaxBest",
 ]
@@ -46,14 +46,34 @@ def SetupCaseSplit(trainer, t_params):
     all_idx = torch.arange(trainer.n_case, device=trainer.device)
     trainer.val_cases = all_idx[:n_val]
     trainer.train_pool = all_idx[n_val:]
+    n_bins = int(t_params.get("case_bins", 0))
+    if n_bins > 1:   # 1/E 영역 특화 프로브: val/train 모두 같은 에너지 빈으로 제한
+        mask, (lo, hi) = CaseBinMask(trainer, n_bins, int(t_params.get("case_bin", 0)))
+        trainer.val_cases = trainer.val_cases[mask[trainer.val_cases]]
+        trainer.train_pool = trainer.train_pool[mask[trainer.train_pool]]
+        print(f"[case_bin] {t_params.get('case_bin', 0)}/{n_bins}  log(e_rel/e_flip) in [{lo:.3f}, {hi:.3f}]  "
+              f"val {len(trainer.val_cases)}  train {len(trainer.train_pool)}")
     trainer.active_cases = trainer.train_pool[:max_cases]
+
+
+def CaseBinMask(trainer, n_bins, k):
+    # Quantile bin of the flip-barrier energy ratio over the train pool // 라우팅 변수 = log(e_rel/e_flip)
+    #   창 보존량(케이스 상수)이라 마칭 내내 같은 빈에 머문다.
+    #   분위 경계는 val 제외 train pool 기준 (SetupCaseSplit 시점의 전체 pool, max_cases 절단 전).
+    ic = trainer.data[:, 0][:, [1, 2, 3, 4]]
+    r = trainer._EnergyGate(ic, trainer.params_raw).squeeze(1).double()
+    q = torch.linspace(0.0, 1.0, n_bins + 1, dtype=torch.float64, device=r.device)
+    edges = torch.quantile(r[trainer.train_pool], q)
+    lo, hi = edges[k], edges[k + 1]
+    mask = (r >= lo) & ((r <= hi) if k == n_bins - 1 else (r < hi))
+    return mask, (float(lo), float(hi))
 
 
 _NAN2 = (float("nan"), float("nan"))
 
 
 class EvalPrecision:
-    """평가 구간만 TF32 off // 2026-08-01
+    """평가 구간만 TF32 off
 
     matmul_precision="high"(TF32)는 matmul당 상대오차 ~5e-4로, 목표 정확도 1e-3과 **같은
     자릿수**다. 학습은 TF32를 유지하되(속도 26% 이득, trap 18) 평가만 순수 FP32로 돌려야
@@ -108,14 +128,16 @@ def ComputeVal(trainer, device, batch_size):
                 if is_flip is not None and tw > 0
                 else None
             )
-            for start in range(0, n_total, batch_size):
-                end = min(start + batch_size, n_total)
+            n_q = tw if getattr(trainer, "n_tok", 0) > 0 else 1   # xattn: 케이스 경계에 맞춘 배치
+            bs_eff = max(n_q, (batch_size // n_q) * n_q)
+            for start in range(0, n_total, bs_eff):
+                end = min(start + bs_eff, n_total)
                 feats = trainer._BuildFeats(
                     frame["tau"][start:end],
                     frame["params"][start:end],
                     frame["ic_flat"][start:end],
                 )
-                out = trainer(feats)
+                out = trainer(feats, n_q=n_q)
                 th_e = ((out[:, :2] - frame["theta_true"][start:end]) ** 2).mean(dim=1)
                 om_e = ((out[:, 2:] - frame["omega_true"][start:end]) ** 2).mean(dim=1)
                 th_sum["all"] += float(th_e.sum())
@@ -271,6 +293,63 @@ def AppendResumeLog(cfg_path, epoch, step, ckpt_name, changes):
         lines.append(f"#   {key}: {old_val} -> {new_val}")
     with open(cfg_path, "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+
+PARAM_DELTA_FILE = "param_delta.csv"
+
+
+def _ParamGroupName(name):
+    # "blocks.3.fc1.weight" → "blocks.3"; "head_theta.weight" → "head_theta" // 레이어 그룹 = 최상위 모듈(+인덱스)
+    parts = name.split(".")
+    if len(parts) >= 2 and parts[1].isdigit():
+        return ".".join(parts[:2])
+    return parts[0]
+
+
+class ParamDeltaLog:
+    # Per-epoch parameter change per layer group: rel = ‖θ_e − θ_{e−1}‖₂ / ‖θ_{e−1}‖₂ on raw
+    #   (non-EMA) trainable weights, plus all / all_abs / all_norm totals. Own CSV (param_delta.csv) so
+    #   log.csv's CSV_HEADER stays fixed for ReadLogBests. Resume: rows ≥ start_epoch dropped, first delta is
+    #   measured against the loaded checkpoint.
+    # // epoch마다 레이어 그룹별 상대 파라미터 변화량 기록. 별도 CSV, resume 시 start_epoch 이후 행 버림
+    def __init__(self, trainer, ckpt_dir, start_epoch):
+        self.trainer = trainer
+        self.path = Path(ckpt_dir) / PARAM_DELTA_FILE
+        self.groups = {}
+        for n, p in trainer.named_parameters():
+            if p.requires_grad:
+                self.groups.setdefault(_ParamGroupName(n), []).append(n)
+        self.header = ["Epoch", "Step", "LR", "all", "all_abs", "all_norm"] + list(self.groups)
+        self.rows = []
+        if self.path.exists():
+            with open(self.path, newline="") as f:
+                self.rows = [r for r in csv.DictReader(f) if int(r["Epoch"]) < start_epoch]
+        self.prev = self._Snapshot()
+
+    def _Snapshot(self):
+        return {n: p.detach().clone() for n, p in self.trainer.named_parameters() if p.requires_grad}
+
+    @torch.no_grad()
+    def Record(self, epoch, step, lr):
+        cur = self._Snapshot()
+        row = {"Epoch": epoch, "Step": step, "LR": lr}
+        tot_d = tot_n = 0.0
+        for g, names in self.groups.items():
+            d = sum(float((cur[n] - self.prev[n]).pow(2).sum()) for n in names)
+            m = sum(float(self.prev[n].pow(2).sum()) for n in names)
+            row[g] = math.sqrt(d) / max(math.sqrt(m), 1e-12)
+            tot_d += d
+            tot_n += m
+        row["all"] = math.sqrt(tot_d) / max(math.sqrt(tot_n), 1e-12)
+        row["all_abs"] = math.sqrt(tot_d)
+        row["all_norm"] = math.sqrt(tot_n)
+        self.rows.append(row)
+        self.prev = cur
+        with open(self.path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=self.header)
+            w.writeheader()
+            w.writerows(self.rows)
 
 
 def ReadLogBests(log_path, warmup_epochs=0):
@@ -516,6 +595,8 @@ def RunTrainLoop(
     gnorm_ref = None        # 직전 rebalance 직후의 항별 log 노름비 스냅샷
     snap_pending = False    # rebalance 다음 (non-replay) 에폭 시작에 스냅샷을 뜬다
 
+    param_log = ParamDeltaLog(trainer, ckpt_dir, start_epoch)   # 레이어별 파라미터 변화량 // param_delta.csv
+
     pbar = tqdm(range(start_epoch, t_params["max_epochs"]), desc="Training", dynamic_ncols=True)
 
     try:
@@ -646,9 +727,8 @@ def RunTrainLoop(
                     else:
                         metric_t, losses = trainer.BackwardAll(batch, colloc_meta, ic_parts, roll_loss=roll_loss)
 
-                    # 손실이 유한해도 grad는 NaN/Inf일 수 있다 (roll의 Huber/clamp 경로가 실제로 그랬다).
-                    # 손실만 보던 구판은 그 스텝을 통과시켜 가중치를 오염시켰고, 이후 전 항이 NaN이
-                    # 되면서 런이 죽었다 (2026-08-19 _ft_adapter, ep218). clip 반환값 = 클립 전 전체
+                    # 손실이 유한해도 grad는 NaN/Inf일 수 있다 (roll의 Huber/clamp 경로). 손실만 보면
+                    # 그 스텝이 가중치를 오염시켜 이후 전 항이 NaN이 된다. clip 반환값 = 클립 전 전체
                     # grad 노름이라 추가 비용 없이 grad 쪽 판정을 얻는다. // guard grads, not just loss
                     gnorm = torch.nn.utils.clip_grad_norm_(trainer.parameters(), train_cfg.grad_clip)
                     # 스텝당 host sync는 여기 1회뿐 — 손실·grad 두 판정값을 한 텐서로 묶어 sync를 늘리지
@@ -773,7 +853,7 @@ def RunTrainLoop(
                     )
 
             # OdeScheduler: patience 타이머 + Val/Extrap/Rollout veto // 하나라도 개선 중이면 LR decay 보류
-            # rollout 계산 뒤로 옮김 (2026-07-28) — 이 프로젝트 1순위 지표를 veto에 넣으려면 값이 먼저 있어야 함
+            # rollout 계산 뒤에 둔다 — 1순위 지표를 veto에 넣으려면 값이 먼저 있어야 함
             if sched_on:
                 sched_val = val_metric if do_val else None
                 sched_ext = extrap_loss if not math.isnan(extrap_loss) else None
@@ -823,6 +903,7 @@ def RunTrainLoop(
                 "RollTauMaxBest":    tau_max_best,
             })
             WriteLog(log_path, log_rows)
+            param_log.Record(epoch, step, lr)   # raw 가중치 기준 (RestoreRaw 이후)
 
             pbar.set_postfix({
                 "step":    step,

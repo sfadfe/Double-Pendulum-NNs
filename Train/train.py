@@ -28,6 +28,11 @@ def Train(MainFolderPath, cfg_path=None):
         cfg_path = Path(__file__).parent / "config.toml"
     net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
 
+    # Fixed seed for fresh pretrain: every RNG in the pipeline is torch (init, batch draws,
+    #   colloc, roll k0/depth), and manual_seed covers CUDA too.
+    # // 시드 고정 — 런 간 차이를 시드가 아닌 설정 효과로 읽기 위함 (SetupFinetune의 42와 동일)
+    torch.manual_seed(42)
+
     shutil.copy(cfg_path, MainFolderPath / "config.toml")
 
     torch.set_float32_matmul_precision(train_cfg.matmul_precision)
@@ -36,6 +41,14 @@ def Train(MainFolderPath, cfg_path=None):
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
     trainer.Setup(base_dir, MainFolderPath)
     SetupCaseSplit(trainer, t_params)
+    if train_cfg.freeze_from:   # 예측 구간 동결 스크린: 블록 1..k·FiLM(A)·stage head 0 로드 후 동결
+        fz_path = base_dir / train_cfg.freeze_from
+        ckpt = torch.load(fz_path, map_location=device, weights_only=False)
+        trainer._CheckHardIC(ckpt, fz_path)
+        trainer.FreezeBelowStage(ckpt["model_state"], fz_path.parent / "config.toml")
+        trainer.SetOptimizerAdamW()   # trainable만 // optimizer over trainable params only
+        trainer._ResetEMA()
+        tqdm.write(f"[freeze] {fz_path}: prediction region (blocks 1..{train_cfg.freeze_below}) frozen")
 
     RunTrainLoop(
         trainer, device, train_cfg, data_cfg, t_params,
@@ -62,6 +75,9 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
     trainer.Setup(base_dir, ckpt_dir)
     SetupCaseSplit(trainer, t_params)
+    if train_cfg.freeze_from:   # resume: 동결 플래그만 재적용 (가중치는 latest.pt) — optimizer 그룹 크기 일치
+        trainer.FreezeBelowStage(None)
+        trainer.SetOptimizerAdamW()
 
     start_step, _, sched_state = trainer.LoadCheckpoint(ckpt_path)
 

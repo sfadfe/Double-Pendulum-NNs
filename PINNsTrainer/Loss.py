@@ -6,9 +6,7 @@ class Loss:
     # 컴파일 단위는 "feats를 받아 손실 스칼라를 내는 슬라이스"다. feats 생성(_BuildFeats,
     # param_embed 포함)은 밖에 두는데, 그래야 매 스텝 바뀌는 인덱싱·gather가 그래프에 안 들어온다.
     # param_embed의 gradient는 경계에서 feats의 grad로 받아 eager로 이어져 흐른다 — 손실 없음.
-    #   측정(2026-07-30): 물리 슬라이스 fwd+bwd 9.23 → 5.54 ms, 순수 forward 5.39 → 3.91 ms,
-    #   peak VRAM 397 → 232 MB. mixed FP32/FP64 그래프에서 FP64는 dtype 그대로 보존된다
-    #   (eager 대비 rel err 2e-16; FP32로 강등됐다면 2e-7이 나온다). // [[fp64-not-bottleneck]]
+    #   mixed-dtype 그래프에서도 dtype은 그대로 보존된다. // [[fp64-not-bottleneck]]
     # dynamic=False: shape별 정적 그래프. 청크 크기가 몇 종류인지가 그래프 수 = 컴파일 대기시간이다
     #   (n_colloc이 colloc_chunk의 배수가 아니면 나머지 청크용으로 하나 더 생긴다).
     # 컴파일된 함수는 __dict__에 직접 담는다 — nn.Module 속성으로 들어가면 state_dict 오염 위험.
@@ -29,15 +27,16 @@ class Loss:
             cache[key] = torch.compile(fn, dynamic=False)
         return cache[key]
 
-    def StateDerivs(self, feats):
+    def StateDerivs(self, feats, n_q=1):
         # net outputs [Δθ, ω]; one forward-mode pass gives [dΔθ/dt, dω/dt]
+        # n_q: xattn nets — case-major rows, n_q per case (token rows get zero τ-tangent inside forward)
         # dΔθ/dt = dθ/dt since θ_IC is constant → kin residual (dΔθ/dt = ω) unchanged
         # feats: (M, feat_dim) ; col 0 = τ, col 1: = case-constant (IC + param_embed)
         # FP32 jvp: network params are FP32 anyway — no precision gain from FP64 functional_call
         # // FP32 jvp로 FP32 코어 활용 (검증: domega/dt floor 1.8e-5 << 잔차 O(100)). AngularAccel/GetEnergy만 FP64 유지
         t = feats[:, 0:1].float()
         rest = feats[:, 1:].float()
-        # FiLM (γ, β) outside the jvp (2026-08-31): it depends on case columns only, so its τ-tangent
+        # FiLM (γ, β) outside the jvp: it depends on case columns only, so its τ-tangent
         # is identically 0 — but jvp would still push a materialized zero tangent through the cond
         # MLP (128 → 2·n_blocks·width: as many MACs as the whole trunk) and autograd would then
         # differentiate that dead tangent path too. Compute it once here and hand it in as a primal
@@ -48,13 +47,21 @@ class Loss:
         # layout through view ops (unbind) — contiguous copy (N·n·width, memory-bound, ~0.1 ms).
         # // primal/tangent 레이아웃 불일치 → forward-AD 뷰 연산 assert. contiguous로 통일
         cond = tuple(c.contiguous() for c in self.CondOf(feats.float()))
+        # xattn: window-token streams are query-independent → computed here once per case (outside
+        # the jvp, still in the backward graph) and passed as zero-tangent primals. The forward-AD then runs on
+        # the query rows only (token rows inside the jvp cost 7× on the kin term). // 토큰 상태는 jvp 밖에서
+        n_c = len(cond)
+        tok_hs = ()
+        if getattr(self, "n_tok", 0) > 0:
+            tok_hs = tuple(v.contiguous() for v in self.TokenStates(feats[::n_q].float(), tuple(c[::n_q] for c in cond)))
 
-        def f(tc, rc, *cd):                               # (M, 1), (M, F-1), γ, β -> ((M,2), (M,2))
+        def f(tc, rc, *rest_p):                           # (M, 1), (M, F-1), γ, β, [tok...] -> ((M,2), (M,2))
             x = torch.cat([tc, rc], dim=1)
-            out = self(x, cond=cd)                        # (M, 4) [θ1, θ2, ω1, ω2]
+            cd, th = rest_p[:n_c], rest_p[n_c:]
+            out = self(x, cond=cd, n_q=n_q, tok_hs=th or None)   # (M, 4) [θ1, θ2, ω1, ω2]
             return out[:, :2], out[:, 2:]                 # theta, omega
 
-        primals = (t, rest) + cond
+        primals = (t, rest) + cond + tok_hs
         tangents = tuple(torch.ones_like(t) if i == 0 else torch.zeros_like(v) for i, v in enumerate(primals))
 
         # single jvp // d/dt [θ, ω] = [dθ/dt, dω/dt]
@@ -69,54 +76,80 @@ class Loss:
         (theta, omega), (dtheta_dt, domega_dt) = tf.jvp(f, primals, tangents)
         return theta, omega, dtheta_dt, domega_dt
 
+    @staticmethod
+    def _TrimMean(per_row, q):
+        # Mean over rows with the top-q fraction (by detached value) dropped from the gradient // 손실 상위 q 행 제외 평균
+        #   kthvalue with a static k keeps the compiled graph shape-static.
+        if q <= 0.0:
+            return per_row.mean()
+        d = per_row.detach().float()
+        k = max(1, int(d.shape[0] * (1.0 - q)))
+        keep = d <= torch.kthvalue(d, k).values
+        return (per_row * keep).sum() / keep.sum()
+
     def _KinTerm(self, omega, dtheta_dt):
         # kin = 두 헤드를 잇는 커플러 (ω := dθ/dτ). // structural glue, not a physics law
         # 분모 = omega_rms² (데이터에서 뽑은 고정 스케일). 학습 중 변하지 않는다.
         #   구버전은 mean(dθ/dτ²).detach()를 썼는데 이게 자기무효화였다: dθ/dτ가 노이즈로 커지면
         #   분모도 같이 커져서 kin → 1.0에 포화하고 gradient가 (17.24/1.49)² ≈ 133× 감쇠.
-        #   즉 "고칠 대상이 분모를 부풀려 자기 억제를 끈다". 측정(2026-07-28,
-        #   model/2026_07_24_10_33_11/best.pt): kin=0.978 고착, corr(ω, dθ/dτ)=0.12.
+        #   즉 "고칠 대상이 분모를 부풀려 자기 억제를 끈다".
         #   고정 분모면 노이즈가 커질수록 kin도 커져 억제가 유지된다. // [[kin-derivative-noise]]
         # init grad 폭주 방지는 kin_ramp_epochs(0→1 램프) + RebalanceGradScales([0.1,10] clamp)가 담당.
         # 되돌리려면 이 한 줄만 원복. 단 kin 값의 단위가 바뀌므로 과거 로그와 직접 비교 불가.
         # _kin_detach=True(Phase 2): dθ/dτ 기준 고정, ω_head가 추종 → rollout 핸드오프 ω 드리프트 억제.
         # _kin_detach=False(Phase 1): 대칭 — 두 헤드가 함께 커플링 학습.
         scale = self.omega_rms.detach() ** 2 + self.dataCfg.kin_eps
+        q = self.trainCfg.trim_q_kin
+        if q > 0.0:   # 행별 kin에서 상위 q 제외 // off면 아래 종전 경로 그대로
+            ref = dtheta_dt.detach() if getattr(self, "_kin_detach", False) else dtheta_dt
+            return self._TrimMean(((ref - omega) ** 2).mean(dim=1), q) / scale
         if getattr(self, "_kin_detach", False):
             return torch.mean((omega - dtheta_dt.detach()) ** 2) / scale
         return torch.mean((dtheta_dt - omega) ** 2) / scale
 
-    def KinLoss(self, feats):
-        return self._Compiled("kin", self._KinLossImpl)(feats)
+    def KinLoss(self, feats, n_q=1):
+        return self._Compiled("kin", self._KinLossImpl)(feats, n_q)
 
-    def _KinLossImpl(self, feats):
+    def _KinLossImpl(self, feats, n_q=1):
         # Phase 1 커플링 전용: kin만 (jvp, FP64 EOM/energy 없음) // cheap structural coupling
-        _, omega, dtheta_dt, _ = self.StateDerivs(feats.float())
+        _, omega, dtheta_dt, _ = self.StateDerivs(feats.float(), n_q)
         return self._KinTerm(omega, dtheta_dt)
 
-    def DataLoss(self, feats, theta_true, omega_true):
-        return self._Compiled("data", self._DataLossImpl)(feats, theta_true, omega_true)
+    def DataLoss(self, feats, theta_true, omega_true, n_q=1):
+        return self._Compiled("data", self._DataLossImpl)(feats, theta_true, omega_true, n_q)
 
-    def _DataLossImpl(self, feats, theta_true, omega_true):
-        out = self(feats)                                 # (N, 4)
+    def _DataLossImpl(self, feats, theta_true, omega_true, n_q=1):
+        out, stages = self(feats, Stages=True, n_q=n_q)   # (N, 4), [x̂_k]  (n_q: xattn 케이스 묶음)
         theta, omega = out[:, :2], out[:, 2:]
-        return torch.mean((theta - theta_true) ** 2) + torch.mean(
+        q = self.trainCfg.trim_q_data
+        if q > 0.0:   # 행별 (θ+ω) 손실 상위 q 제외, 단계 감독도 같은 방식 // trim_q_data
+            def Row(x):
+                return ((x[:, :2] - theta_true) ** 2).mean(dim=1) + ((x[:, 2:] - omega_true) ** 2).mean(dim=1)
+            l_data = self._TrimMean(Row(out), q)
+            for x_k in stages if self.stage_w > 0 else ():
+                l_data = l_data + self.stage_w * self._TrimMean(Row(x_k), q)
+            return l_data
+        l_data = torch.mean((theta - theta_true) ** 2) + torch.mean(
             (omega - omega_true) ** 2
         )
+        # 중간 단계 감독 (stage_at): x̂_k도 같은 데이터 손실, 가중 stage_w. 최종과 같은 스케일
+        for x_k in stages if self.stage_w > 0 else ():
+            l_data = l_data + self.stage_w * (torch.mean((x_k[:, :2] - theta_true) ** 2)
+                                              + torch.mean((x_k[:, 2:] - omega_true) ** 2))
+        return l_data
 
-    def _PhysicsEnergySlice(self, feats, params, e0, ic_theta):
+    def _PhysicsEnergySlice(self, feats, params, e0, ic_theta, n_q=1):
         return self._Compiled("phys", self._PhysicsEnergySliceImpl)(
-            feats, params, e0, ic_theta
+            feats, params, e0, ic_theta, n_q
         )
 
-    def _PhysicsEnergySliceImpl(self, feats, params, e0, ic_theta):
+    def _PhysicsEnergySliceImpl(self, feats, params, e0, ic_theta, n_q=1):
         # Single colloc slice // 콜로케이션 청크 1개분 물리+에너지 손실
-        theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float())
+        theta, omega, dtheta_dt, domega_dt = self.StateDerivs(feats.float(), n_q)
         l_kin = self._KinTerm(omega, dtheta_dt)
 
-        # 2026-08-30: FP64 → FP32. FP64는 trunk에 없었고 여기(EOM·에너지)만 썼는데 비용 ≈ 0이라
-        #   두었던 것. 목표 상대잔차 1e-3~1e-5 대비 fp32 반올림 6e-8×상쇄 증폭은 여유가 2자리 이상
-        #   → 정확도 기대 변화 0, FP64-free 학습·추론 경로 통일이 목적. 변수명 *64는 그대로 둔다.
+        # EOM·에너지도 FP32: 목표 상대잔차 1e-3~1e-5 대비 fp32 반올림×상쇄 증폭은 여유가 2자리 이상.
+        #   변수명 *64는 FP64 시절 이름 그대로.
         with torch.autocast(device_type=self.device_type, enabled=False):
             p64 = params.float()
             e0_64 = e0.float()
@@ -127,7 +160,7 @@ class Loss:
                 th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1], p64
             )
             denom = f_eom.abs() + self.dataCfg.phys_eps
-            l_phys = torch.mean(((dom64 - f_eom) / denom) ** 2).float()
+            l_phys = self._TrimMean((((dom64 - f_eom) / denom) ** 2).mean(dim=1), self.trainCfg.trim_q_phys).float()
             state = torch.stack(
                 [th64[:, 0], om64[:, 0], th64[:, 1], om64[:, 1]], dim=1
             )
@@ -165,7 +198,7 @@ class Loss:
         return self._RobustRollMean(self._RolloutMergedDraws(case_idx, n_draws, n_points))
 
     def _RolloutMergedDraws(self, case_idx, n_draws, n_points):
-        # All draws in one batch (2026-08-31). Per-draw (k0, depth) become per-case vectors; the
+        # All draws in one batch. Per-draw (k0, depth) become per-case vectors; the
         # pushforward runs max(depth) rounds over every case and freezes a case (torch.where) once
         # its own depth is reached. Rows are independent through the network, so each case sees
         # exactly the sequential-draw computation — only the batch it shares changes.
@@ -308,15 +341,20 @@ class Loss:
         # c는 배치 median의 배수(detach) → 하이퍼파라미터 없이 학습 진행에 따라 자동 축소.
         # c의 median EMA(roll_median_ema>0): 스케일 자체가 스텝마다 흔들리면 그것도 노이즈원이라
         #   같은 손실값이 스텝마다 다른 gradient 크기를 갖는다. EMA면 c가 학습 진행은 따라가되
-        #   추첨 노이즈는 빠진다. detach 유지 — c는 상수 취급. // 2026-08-01
+        #   추첨 노이즈는 빠진다. detach 유지 — c는 상수 취급.
         k = self.trainCfg.roll_robust_k
         if k <= 0.0:
             return per_case.mean()                      # 0 → 기존 순수 평균 // opt-out
-        med = per_case.detach().median()
+        # nanmedian + skip EMA update when med is non-finite: torch.median propagates NaN, and one diverged
+        #   draw would write NaN into _roll_median → c=NaN → every later step skipped as "[NaN] roll" with
+        #   weights frozen. where → no host sync.
+        # // NaN draw는 median에서 제외, med 비유한이면 EMA는 직전 값 유지 — 1스텝 오염이 영구 교착이 됐던 버그
+        med = per_case.detach().nanmedian()
         beta = getattr(self.trainCfg, "roll_median_ema", 0.0)
         if beta > 0.0:
             prev = self.__dict__.get("_roll_median")
-            med = med if prev is None else beta * prev + (1.0 - beta) * med
+            if prev is not None:
+                med = torch.where(torch.isfinite(med), beta * prev + (1.0 - beta) * med, prev)
             self.__dict__["_roll_median"] = med.detach()
         c = k * med + 1e-12
         kind = getattr(self.trainCfg, "roll_robust_kind", "cauchy")

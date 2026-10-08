@@ -108,10 +108,7 @@ class OdeScheduler:
     """decay_every(=patience) 에폭 경과 시 LR decay 시도. Val/Extrap/Rollout이 실제
     개선 중이면 보류(veto), 보류 누적이 max_veto_epochs를 넘으면 강제 decay.
 
-    2026-07-31 축약: phys StallTracker(ema_beta/rel_tol) 제거. rel_tol 0.2~0.3은
-    **에폭당** 20~30% 개선 요구라 phase 2에서 도달 불가 → phys는 상시 stalled였다
-    (실측: pretrain_termclip.log의 veto 로그마다 stall phys=patience 포화, 최대 1430).
-    즉 실효 동작이 "patience 에폭 경과 후 decay 시도"였으므로 그 타이머만 남긴다.
+    phys 정체 판정은 없다 — patience 에폭 경과 후 decay 시도하는 타이머만 둔다.
     판정만 담당 — LR 쓰기는 전부 self.lr(LrPolicy), 게이트 정체 판정은 StallTracker 위임.
     """
 

@@ -52,10 +52,7 @@ class LambdaBalance:
 
     # --- 항별 clip 후 누적 // per-term clip, then accumulate ---
     # BackwardAll은 항을 .grad에 순차 누적하고 loop_common이 끝에서 clip 1회를 건다(trap #8).
-    # 그러면 한 항이 폭주할 때 clip 배율이 전 항에 똑같이 걸려 나머지가 지워진다.
-    #   측정(2026-07-29, model/2026_07_28_03_39_08 ep3100~3140):
-    #   유효 phys = scale 0.01 × ‖g‖ 1.0e2~2.9e3 = 1~29, 유효 data = 1.0 × 0.29 고정.
-    #   grad_clip=1.0이므로 실제 적용되는 data gradient가 스텝마다 0.29~0.01로 29배 요동 —
+    # 그러면 한 항이 폭주할 때 clip 배율이 전 항에 똑같이 걸려 나머지가 지워진다 —
     #   phys의 "평균 크기"가 아니라 "분산"이 data·roll·ic의 유효 LR을 무작위 감쇠시킨다.
     # 항별로 먼저 clip하면 폭주 항만 예산에 눌리고 나머지는 원래 크기를 유지한다.
     # roll은 이 모델의 목표(윈도우 핸드오프 오차 최소화)를 직접 담당하는 항이라
@@ -63,8 +60,7 @@ class LambdaBalance:
     # 분리 단위는 {data, physics(kin+phys+energy combo), ic, roll} — physics는 청크당 combo 1회
     # backward라 셋을 쪼개면 jvp 비용이 3배가 된다. 폭주하는 건 그 combo 자체라 이 단위로 충분.
     def _TermClipBudget(self):
-        # 예산 = grad_clip 고정 — term_grad_clip 옵션은 전 config가 0(=grad_clip 사용)으로
-        # 수렴해 제거 (2026-08-19). 항별 clip 자체는 하한 제거의 전제라 끄는 경로도 없앴다.
+        # 예산 = grad_clip 고정. 항별 clip 자체는 하한 제거의 전제라 끄는 경로가 없다.
         return self.trainCfg.grad_clip
 
     # --- rebalance 주기 자동화: 항별 노름비 drift 감지 ---
@@ -159,12 +155,8 @@ class LambdaBalance:
 
     # --- 손실 스칼라는 GPU에 누적, host sync는 스텝 끝 1회 // no per-chunk sync ---
     # float(loss.detach())는 그 자리에서 GPU→CPU 왕복을 강제해 파이프라인을 세운다. 청크마다
-    # 4개 항(kin/phys/energy/combo)씩 걸려 있었으므로 스텝당 sync가 30회를 넘었다.
-    #   측정(2026-07-30, 실제 스텝 eager+high, max_cases 10000/n_colloc 10240):
-    #   122.60 → 117.88 ms (3.9%). gradient는 **bitwise 동일**(torch.equal 검증) — 계산은
-    #   그대로고 읽는 시점만 뒤로 밀린다. 항별 avg 값만 GPU FP32 누적으로 바뀌어 relΔ ~1e-7.
-    #   합성 스텝 모사에서는 21%가 나왔는데 그건 청크 수가 적어 sync 스톨이 안 가려진 조건이었다 —
-    #   실제 스텝은 청크당 GPU 작업이 커서 CPU가 대부분 따라잡는다. 이득의 본체는 compile 쪽.
+    # 4개 항(kin/phys/energy/combo)씩 걸리면 스텝당 sync가 30회를 넘는다.
+    #   gradient는 bitwise 동일 — 읽는 시점만 뒤로 밀린다. 항별 avg 값만 GPU FP32 누적이라 relΔ ~1e-7.
     # 남는 sync는 loop_common의 NaN 스킵 판정 1회뿐이다 (optimizer.step 전에 host 값이 필요).
     def _BackwardKinChunks(self, meta, metric_out, losses_out):
         # Phase 1 커플러 전용: kin만 backward (jvp, FP64 없음) // 헤드 연결을 데이터피팅과 함께 조기 확립
@@ -176,7 +168,7 @@ class LambdaBalance:
             e = min(s + chunk, n)
             sl = slice(s, e)
             feats = self._BuildFeats(meta["tau"][sl], meta["params"][sl], meta["ic_state"][sl])
-            lk = self.KinLoss(feats)
+            lk = self.KinLoss(feats, meta.get("n_q", 1))
             frac = (e - s) / n
             weighted = lam["kin"] * self.grad_scale["kin"] * self.kin_ramp * lk * frac
             weighted.backward(retain_graph=False)
@@ -197,7 +189,7 @@ class LambdaBalance:
             feats = self._BuildFeats(meta["tau"][sl], meta["params"][sl], meta["ic_state"][sl])
             ic_theta = meta["ic_state"][sl, [0, 2]]
             lk, lp, le = self._PhysicsEnergySlice(
-                feats, meta["params"][sl], meta["e0"][sl], ic_theta
+                feats, meta["params"][sl], meta["e0"][sl], ic_theta, meta.get("n_q", 1)
             )
             pr = self._PhysRamp()
             combo = (
@@ -340,7 +332,7 @@ class LambdaBalance:
                     feats_i = self._BuildFeats(
                         colloc_meta["tau"][sl], colloc_meta["params"][sl], colloc_meta["ic_state"][sl]
                     )
-                    parts = self._PhysicsEnergySlice(feats_i, p_sl, e0_sl, ic_theta)
+                    parts = self._PhysicsEnergySlice(feats_i, p_sl, e0_sl, ic_theta, colloc_meta.get("n_q", 1))
                     sums[key] += self._GradNormOfLoss(parts[idx])
 
                 if ic_parts:
@@ -370,13 +362,9 @@ class LambdaBalance:
 
         g = {k: sums[k] / cnt for k in sums}        # 평균 grad 노름
         anchor = g["data"] + eps
-        # clamp 하한 제거 (2026-07-29). 하한 0.1 → 0.01로 낮췄을 때 **0.01에도 그대로 붙박이**임을
-        #   확인했다(같은 런 ep~1750~3141 내내 scale phys=1.00e-02). 앵커가 요구하는 값은 ~1e-3이라
-        #   하한을 또 내리는 건 같은 실패의 반복 — 문제는 하한값이 아니라 clamp로 앵커를 쫓는 구조다.
-        #   하한은 아무것도 보호하지 않는다: gradient가 큰 항이 작은 scale을 받는 게 밸런서의 목적이고,
-        #   매 rebalance마다 fresh ‖g‖로 재계산하므로 "0으로 떨어져 못 돌아옴"도 없다.
-        #   폭주 방지는 상한의 역할이며, 상한도 10 → 100으로 완화했다 (energy가 앵커 요구값 ~12를
-        #   못 받고 9.94~9.99로 10에 붙박이였다 = energy 밸런싱도 꺼져 있었다).
+        # clamp 하한 없음. 하한은 아무것도 보호하지 않는다: gradient가 큰 항이 작은 scale을 받는 게
+        #   밸런서의 목적이고, 매 rebalance마다 fresh ‖g‖로 재계산하므로 "0으로 떨어져 못 돌아옴"도 없다.
+        #   폭주 방지는 상한(grad_scale_max)의 역할. // [[grad-scale-floor-pinned]]
         # 하한 제거는 항별 clip(_TermClipBudget)이 있어야 안전하다 — 단독으로는 쓰지 말 것.
         hi = getattr(self.trainCfg, "grad_scale_max", 100.0)
         for k in g:
@@ -414,7 +402,12 @@ class TimeMarching:
         span = t_hi - t_lo
         tau = torch.rand(n, 1, device=self.device) * span
 
-        local_idx = torch.randint(0, len(case_pool), (n,), device=self.device)
+        # xattn nets: per_case rows share one case (case-major groups) so forward(n_q=per_case) can build the
+        # window tokens once per case. n must be a multiple of per_case. // 케이스당 per_case개 τ 묶음
+        n_q = self.collocCfg.per_case if getattr(self, "n_tok", 0) > 0 else 1
+        if n % n_q != 0:
+            raise ValueError(f"n_colloc {n} must be a multiple of colloc per_case {n_q}")
+        local_idx = torch.randint(0, len(case_pool), (n // n_q,), device=self.device).repeat_interleave(n_q)
         pool = case_pool.to(self.device) if case_pool.device != self.device else case_pool
         case_idx = pool[local_idx]
 
@@ -432,9 +425,13 @@ class TimeMarching:
             params = params.to(self.device)
         # off-manifold IC 섭동 (Phase 3, 에폭 램프) // ic_sigma 램프
         sigma = getattr(self, "_colloc_ic_sigma", 0.0)
-        ic_state = ic_base + sigma * torch.randn_like(ic_base) if sigma > 0.0 else ic_base
-        e0 = self.GetEnergy(ic_state.float(), params.float()).detach()   # 2026-08-30: FP32 (Loss.py 주석)
-        return {"tau": tau, "ic_state": ic_state, "params": params, "e0": e0}
+        if sigma > 0.0:   # 섭동은 케이스 단위(같은 그룹의 행은 같은 IC — 토큰 행과 일치해야 함)
+            noise = torch.randn(n // n_q, ic_base.shape[1], device=self.device).repeat_interleave(n_q, dim=0)
+            ic_state = ic_base + sigma * noise
+        else:
+            ic_state = ic_base
+        e0 = self.GetEnergy(ic_state.float(), params.float()).detach()   # FP32 (Loss.py 주석)
+        return {"tau": tau, "ic_state": ic_state, "params": params, "e0": e0, "n_q": n_q}
 
     def SetupCollocCases(self, n_colloc=None, flip_bias=0.0):
         # flip finetune: flip-biased colloc_cases 고정(stratified) // 명시적 is_flip balancing
@@ -503,8 +500,10 @@ class TimeMarching:
             ic_flat = state.repeat_interleave(steps, dim=0)       # (n*steps,4)
             feats = self._BuildFeats(tau_flat, params_flat, ic_flat)
             preds = []
-            for s in range(0, n * steps, 4096):
-                preds.append(self(feats[s : s + 4096]))
+            n_q = steps if getattr(self, "n_tok", 0) > 0 else 1   # xattn: 청크를 케이스 경계에 맞춤
+            chunk = (4096 // n_q) * n_q
+            for s in range(0, n * steps, chunk):
+                preds.append(self(feats[s : s + chunk], n_q=n_q))
             out = torch.cat(preds).reshape(n, steps, 4)           # [Δθ1,Δθ2,ω1,ω2]
             # absolute θ = window-start θ + Δθ // 윈도우 시작각에 상대각 누적 → 감김수 자연 복원
             th_abs = state[:, [0, 2]].unsqueeze(1) + out[:, :, :2]
@@ -533,11 +532,11 @@ class TimeMarching:
     def _RollForward(self, feats, n_points):
         # Window forward for case-major rows (n·P): FiLM once per case, expanded to P rows.
         # 같은 케이스의 P점은 cond가 동일한데 행마다 계산하면 cond MLP(트렁크와 같은 FLOP)가 P배 중복.
-        # compile 단위 — feats 생성(gather)은 밖. // 케이스별 FiLM 1회 + compile (2026-08-31)
+        # compile 단위 — feats 생성(gather)은 밖. // 케이스별 FiLM 1회 + compile
         return self._Compiled("roll", self._RollForwardImpl)(feats, n_points)
 
     def _RollForwardImpl(self, feats, n_points):
         n = feats.shape[0] // n_points
         cond = tuple(c.repeat_interleave(n_points, dim=0)
                      for c in self.CondOf(feats[::n_points]))      # 케이스 대표행 (case-major)
-        return self(feats, cond=cond).reshape(n, n_points, 4)
+        return self(feats, cond=cond, n_q=n_points).reshape(n, n_points, 4)

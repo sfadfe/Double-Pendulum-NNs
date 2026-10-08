@@ -104,10 +104,7 @@ class Dataset:
         omega = ic_state[:, [1, 3]] / self.omega_rms
         pn = self.NormParams(params_raw)
         p_emb = self.param_embed(pn)  # Networks.ParamEmbed // option B3
-        parts = [tau, trig, omega, p_emb]
-        if self.netCfg.energy_gate:
-            parts.append(self._EnergyGate(ic_state, params_raw).to(p_emb.dtype))
-        return torch.cat(parts, dim=1)
+        return torch.cat([tau, trig, omega, p_emb], dim=1)
 
     @torch.no_grad()
     def _EnergyGate(self, ic_state, params_raw):
@@ -178,13 +175,24 @@ class Dataset:
 
     def SegmentBatch(self, frame, bs=None):
         # Fresh param_embed graph per step // step마다 param_embed 그래프 새로 구성
+        # Returns (feats, θ, ω, n_q). Plain nets: iid rows, n_q = 1. xattn nets: whole cases (all tw grid rows
+        # of bs//tw random cases, case-major) so forward(n_q=tw) shares the window tokens per case.
+        # // xattn: 행 단위 추첨 대신 케이스 단위(창의 tw행 전부)
         n_total = frame["n_total"]
         bs = min(bs or self.dataCfg.batch_size, n_total)
-        idx = torch.randint(0, n_total, (bs,), device=self.device)
+        if getattr(self, "n_tok", 0) > 0:
+            tw = n_total // max(len(self.active_cases), 1)          # SegmentFrame은 case-major (n_case, tw)
+            n_c = max(1, bs // tw)
+            cases = torch.randint(0, n_total // tw, (n_c, 1), device=self.device)
+            idx = (cases * tw + torch.arange(tw, device=self.device)).reshape(-1)
+            n_q = tw
+        else:
+            idx = torch.randint(0, n_total, (bs,), device=self.device)
+            n_q = 1
         feats = self._BuildFeats(
             frame["tau"][idx], frame["params"][idx], frame["ic_flat"][idx]
         )
-        return feats, frame["theta_true"][idx], frame["omega_true"][idx]
+        return feats, frame["theta_true"][idx], frame["omega_true"][idx], n_q
 
     def ICSamplesRaw(self, max_n=None):
         # IC raw tensors without param_embed // param_embed 없는 IC raw (청크별 feats 생성용)

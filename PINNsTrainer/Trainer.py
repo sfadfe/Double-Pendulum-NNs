@@ -20,12 +20,6 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.device = torch.device(device)
         self.device_type = self.device.type
         self.g = data_cfg.g
-        if train_cfg.use_compile and self.gate_sparse and len(self.flip_adapters) > 0:
-            # nonzero()가 데이터 의존 shape을 만들어 스텝마다 재컴파일을 유발한다.
-            # dense 경로는 수학적으로 더 정확한 쪽(sparse가 g<gate_eps 기여를 버리는 근사)이라
-            # 강제해도 잃는 게 없다 — 실측 nonflip g 0.006 × adapter만큼의 절단오차가 사라진다.
-            self.gate_sparse = False
-            print("[compile] gate_sparse → dense 경로 강제 (nonzero()는 동적 shape)")
         self.to(self.device)
 
     def SetupFinetune(self, base_dir, run_dir, pretrain_dir, seed=42):
@@ -78,9 +72,9 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
             )
 
     def _AdaptState(self, state):
-        # 구조가 커진 ckpt 로드용 어댑터 // energy_gate / flip_adapter가 pretrain 대비 순수 증분이 되도록
+        # 구조가 커진 ckpt 로드용 어댑터 // 신규 파라미터가 pretrain 대비 순수 증분이 되도록
         #  1) 입력열이 부족한 (out, in) 가중치 뒤에 0열을 덧붙인다 (gx_dim 증가분).
-        #  2) ckpt에 없는 신규 키는 현재 초기값을 그대로 쓴다 (flip_adapter는 up이 zero-init).
+        #  2) ckpt에 없는 신규 키는 현재 초기값을 그대로 쓴다 (zero-init 모듈이면 기여 0).
         # 두 경우 모두 새 파라미터의 기여가 0이라 로드 직후 모델은 ckpt와 수치적으로 동일하다.
         own = self.state_dict()
         out = dict(own)
@@ -143,36 +137,79 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
 
     def SetOptimizerAdamW(self):
         c = self.trainCfg
-        params = [p for p in self.parameters() if p.requires_grad]  # adapter_only 동결 존중
+        params = [p for p in self.parameters() if p.requires_grad]  # freeze_from 동결 존중
         self.optimizer = torch.optim.AdamW(
             params, lr=c.lr, weight_decay=c.weight_decay
         )
 
-    def FreezeToAdapters(self):
-        # Adapter-only finetune: freeze all but flip_adapters // trunk 드리프트 구조 차단
-        #   FlipAdapter의 격리 보증은 자기 기여에만 성립하고 flip gradient는 공유 trunk를
-        #   통과한다 — nonflip 결합 0.53×→1.62× 악화의 원인 (md/window_scale_coupling.md §9).
-        #   동결 후 nonflip 출력 변화는 g·|adapter| ≤ 0.006·|adapter|로 유계.
-        #   SetOptimizerAdamW 전에 불러야 옵티마이저가 trainable만 받는다.
-        if len(self.flip_adapters) == 0:
-            raise ValueError(
-                "adapter_only = true인데 flip_adapter_dim = 0 — 학습할 파라미터가 없다"
-            )
-        for p in self.parameters():
-            p.requires_grad_(False)
-        n_train = 0
-        for ad in self.flip_adapters:
-            for p in ad.parameters():
-                p.requires_grad_(True)
-                n_train += p.numel()
+    def FreezeBelowStage(self, state=None, src_cfg_path=None):
+        # Frozen-prediction-region screen:
+        #   copy proj_in / param_embed / blocks[:k] / stage_heads[0] / film (rows of blocks < k) / scaler buffers
+        #   from `state` (stage69 best.pt) and freeze them, so x̂_k is bit-identical across arms. Everything after
+        #   (blocks ≥ k, stage_inj, later stage heads, final heads, film_corr) keeps its fresh init and trains.
+        #   state=None (resume): only the requires_grad flags — weights come from latest.pt.
+        #   Call before SetOptimizerAdamW (optimizer takes trainable params only); caller resets the EMA.
+        # // 예측 구간 동결: k 블록·해당 FiLM 행·stage head 0·사영·스케일러를 ckpt에서 복사 후 동결. stage_inj[0]는 fresh
+        k = self.trainCfg.freeze_below
+        if k <= 0:
+            raise ValueError("freeze_from needs freeze_below > 0")
+        if self.film_split_at != k:
+            raise ValueError(f"freeze_below {k} requires net.film_split_at == {k} (got {self.film_split_at})")
+        if not self.stage_at or self.stage_at[0] != k:
+            raise ValueError(f"freeze_below {k} requires stage_at[0] == {k} (got {self.stage_at})")
+        if any(t != "film" for t in self.block_types[:k]):
+            raise ValueError("frozen prediction region must be film blocks")
+        if src_cfg_path is not None and Path(src_cfg_path).exists():
+            from .config import LoadConfig
+            src_net, _, _, src_data, _, _ = LoadConfig(src_cfg_path)
+            same = (src_net.width == self.netCfg.width and src_net.fourier_l == self.netCfg.fourier_l
+                    and src_net.f_min == self.netCfg.f_min and src_net.f_max == self.netCfg.f_max
+                    and src_net.film_hidden == self.netCfg.film_hidden and src_net.hard_ic == self.netCfg.hard_ic
+                    and tuple(src_net.stage_at)[:1] == (k,) and src_data.march_dt == self.dataCfg.march_dt)
+            if not same:
+                raise ValueError(f"freeze_from config {src_cfg_path} does not match this net (width/fourier/"
+                                 f"film_hidden/hard_ic/stage_at[0]/march_dt)")
+        prefixes = ["proj_in.", "param_embed.", "film.", "stage_heads.0."] + [f"blocks.{i}." for i in range(k)]
+        n_copy = 0
+        if state is not None:
+            with torch.no_grad():
+                for name, t in list(self.named_parameters()) + list(self.named_buffers()):
+                    if not any(name.startswith(p) for p in prefixes):
+                        continue
+                    if name not in state:
+                        raise KeyError(f"freeze_from ckpt lacks {name}")
+                    src = state[name]
+                    if name.startswith("film.net.2."):          # (2·width·n_src, hidden): rows of blocks < k first
+                        src = src[: t.shape[0]]
+                    if src.shape != t.shape:
+                        raise ValueError(f"freeze shape mismatch {name}: ckpt {tuple(src.shape)} vs {tuple(t.shape)}")
+                    t.copy_(src)
+                    n_copy += 1
+                # scaler buffers: same data → same values; copy anyway so HardIC/feats match the source exactly
+                for name in ("omega_rms", "param_mu", "param_sigma"):
+                    if name in state and hasattr(self, name):
+                        own = getattr(self, name)
+                        rel = float((own - state[name].to(own)).norm() / state[name].norm().clamp_min(1e-12))
+                        if rel > 1e-5:
+                            raise ValueError(f"scaler {name} differs from freeze_from by rel {rel:.2e} — different data?")
+                        own.copy_(state[name].to(own))
+                        n_copy += 1
+        n_frozen = 0
+        for name, p in self.named_parameters():
+            if any(name.startswith(pf) for pf in prefixes):
+                p.requires_grad_(False)
+                n_frozen += p.numel()
         n_total = sum(p.numel() for p in self.parameters())
-        print(f"[freeze] adapter-only: {n_train:,}/{n_total:,} 파라미터만 학습")
+        print(f"[freeze] below stage {k}: {n_copy} tensors copied, {n_frozen:,}/{n_total:,} params frozen, "
+              f"{n_total - n_frozen:,} trainable")
+        return n_copy, n_total - n_frozen, n_total
 
     # --- Weight EMA (Polyak averaging) — 후반 진동 매끈화 + best.pt 안정화 // B3 ---
     def InitEMA(self, decay):
         # decay<=0 → 비활성 (ema_state=None, 기존 동작 유지) // opt-out
         self.ema_decay = float(decay)
         self._ema_backup = None
+        self._ema_skip = None      # frozen param names (requires_grad False) — 갱신 생략, UpdateEMA에서 lazy 계산
         if self.ema_decay > 0.0:
             self.ema_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
         else:
@@ -182,14 +219,22 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         # 가중치 교체(LoadWeights/resume) 후 EMA를 현재 가중치로 재초기화 // stale shadow 방지
         if self.ema_state is not None:
             self.ema_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
+        self._ema_skip = None
 
     @torch.no_grad()
     def UpdateEMA(self):
         # 매 optimizer.step 후 호출 // shadow ← decay·shadow + (1-decay)·raw
+        #   Frozen params (FreezeBelowStage) are skipped: d·s + (1−d)·s is not bit-exact in
+        #   fp32, so a constant would random-walk at rounding level (3e-6 rel / 300 steps) into best.pt (EMA).
+        # // 동결 파라미터는 건너뛴다 — 상수의 EMA가 fp32 반올림으로 흔들려 best.pt(EMA)에 들어가는 것 방지
         if self.ema_state is None:
             return
+        if self._ema_skip is None:
+            self._ema_skip = {k for k, p in self.named_parameters() if not p.requires_grad}
         d = self.ema_decay
         for k, v in self.state_dict().items():
+            if k in self._ema_skip:
+                continue
             s = self.ema_state[k]
             if torch.is_floating_point(v):
                 s.mul_(d).add_(v.detach(), alpha=1.0 - d)  # 상수 버퍼는 EMA해도 불변

@@ -72,6 +72,13 @@ class NetCfg:
     #   "embed", one stage, no xattn block; rows case-major with n_q per case (same plumbing as xattn). 0 = off.
     # // 창 상태 보정기: 예측기 x̂_k를 창 격자 P점에서 한 번에 뽑아 4P 벡터 → FFN → z, 케이스의 모든 행 handoff 임베딩에 더함
     win_tokens: int = 0
+    # Activation arms (2026-10-14). block_acts: branch activation per block, length n — "silu" | "ztanh"
+    #   (z·tanh(z), even: folds negatives to positive, σ'(0)=0, σ''(0)=2). film/ffn blocks only. () = all silu.
+    #   stream_act_at: block boundaries (1-based, as stage_at) after which the whole stream goes through SiLU once,
+    #   h ← SiLU(h) (no skip around it). () = off. Neither has parameters → state_dict unchanged.
+    # // block_acts: 블록별 가지 활성함수 (ztanh = 짝함수). stream_act_at: 그 블록 뒤에서 스트림 전체에 SiLU 1회 (skip 없음)
+    block_acts: tuple = ()
+    stream_act_at: tuple = ()
 
     @property
     def gx_dim(self) -> int:
@@ -157,6 +164,20 @@ class TrainCfg:
     #   **추론은 별개** — eval/프로브는 TF32 off (트랩 25).
     matmul_precision: str = "high"
 
+    # fp16 GEMMs on the residual branch only: "off" | "blk" (FiLMBlock.fc1) | "blk+film" (+ FiLMCond last layer).
+    #   The skip stream, heads and losses stay fp32, and so does everything under no_grad (eval, marching, rollout
+    #   pushforward). Not the rejected whole-net autocast. R9700 solo step 62.0 → 48.7 (blk) / 46.4 ms (blk+film);
+    #   gradient cos against fp32 0.9998 (same batch; a different batch gives 0.95). Needs the backward loss
+    #   scale of LambdaBalance._BwScale — trap 29. // 잔차 가지 GEMM만 fp16 (전체 autocast 아님), 기본 off
+    half_gemm: str = "off"
+
+    # Rows per case in the colloc and data batches of a plain FiLM net (no xattn / window tokens). 1 = iid rows.
+    #   K > 1: n/K cases × K τ rows each, case-major. The FiLM cond is then computed once per case and broadcast
+    #   in the block (no per-row (γ, β)): the cond GEMMs and the (γ, β) streams shrink by K. Same total rows, but
+    #   K times fewer distinct cases (and IC perturbations) per step — a change of the training distribution.
+    #   Must divide n_colloc, colloc_chunk and batch_size. // 케이스당 K행으로 묶어 FiLM을 케이스당 1회 계산
+    case_group: int = 1
+
 @dataclass
 class CollocCfg:
     n_colloc: int = 20000
@@ -172,6 +193,18 @@ class CollocCfg:
     #   Ignored (1) when the net has no xattn block. colloc_chunk and n_colloc must be multiples of it.
     # // xattn: 콜로케이션을 케이스당 per_case개 τ로 묶음 (토큰 행 공유), 비-xattn net에선 무시
     per_case: int = 8
+    # Collocation schedule (Trainstep.CollocSchedAt). sched_period = 0 → off: "grid" anchors, the ic_sigma ramp.
+    #   mode of an epoch = sched_modes[(epoch // sched_period) % len(sched_modes)]:
+    #     "grid"    — IC anchor = true state at the segment's window start, τ ~ U[0, span] (the only mode before)
+    #     "any"     — IC anchor = true state at a uniformly random saved time index up to the last window start
+    #     "tau_end" — "grid" anchors; every second row draws τ with density ∝ τ (span·√u)
+    #   sigma target = sched_sigmas[min(epoch // (sched_period·len(sched_modes)), last)], [] → ic_sigma. The first
+    #   target ramps like ic_sigma (0 → target over ic_sigma_warmup epochs after phase-2 entry), each later one
+    #   linearly from the previous target over ic_sigma_warmup epochs after its switch epoch.
+    # // 콜로케이션 스케줄: sched_period 에폭마다 모드 순환, 모드 한 바퀴마다 sigma 목표를 다음 값으로 (0 = 끔)
+    sched_period: int = 0
+    sched_modes: tuple = ("grid",)
+    sched_sigmas: tuple = ()
 
 
 @dataclass
@@ -192,6 +225,28 @@ class DataCfg:
     # kin/phys/ic backward 청크 크기 // 0이면 batch_size 사용. data 배치와 분리해 physics
     #   transient peak 억제. use_compile 하 스위트스팟 4096 (그 위는 수확체감).
     colloc_chunk: int = 0
+    # Data batch rows in phase 2 (0 = batch_size). Must be a multiple of case_group. The compiled data graph
+    #   gets a second shape at the phase boundary (one recompile). // phase 2의 data 배치 크기 (0 = batch_size)
+    batch_size_phase2: int = 0
+
+    # Fine label source of the data term (Dataset.LoadLabels / LabelBatch). "" = off: SegmentFrame / SegmentBatch
+    #   on the corpus grid. label_path: (N, T_f, 4) [θ1, ω1, θ2, ω2] of the same cases in the same order, saved
+    #   every dt_f = t_data_end / (T_f − 1); kept on the training device. Plain nets only (no xattn / window tokens).
+    #   label_dt: label stride inside a window in phase 1. Offsets m·dt_f with (M − m) % stride == 0,
+    #     M = march_dt / dt_f — the window end is always a label, τ = 0 never.
+    #   label_dt_phase2: stride in phase 2 (0 = label_dt), except the "dense" cases, which keep label_dt:
+    #     the top label_dense_frac of all cases by label_score_path ((N,), higher = faster dynamics).
+    #   slide_frac: share of the groups whose window starts at any fine step with the window inside the data span,
+    #     instead of the segment's grid start.
+    #   march_dt, label_dt and label_dt_phase2 must be integer multiples of dt_f.
+    # // data 항의 촘촘한 라벨 소스 ("" = 끔). 창 안 라벨 간격은 phase 1 label_dt, phase 2 label_dt_phase2
+    #   (점수 상위 label_dense_frac 케이스는 label_dt 유지), slide_frac 몫의 그룹은 창 시작을 격자 밖 임의 시점으로
+    label_path: str = ""
+    label_score_path: str = ""
+    label_dt: float = 0.0
+    label_dt_phase2: float = 0.0
+    label_dense_frac: float = 0.0
+    slide_frac: float = 0.0
 
 
 def LoadConfig(path):
@@ -222,6 +277,7 @@ def LoadConfig(path):
         attn_tokens=n.get("attn_tokens", 8),
         xattn_tokens=n.get("xattn_tokens", 8), xattn_heads=n.get("xattn_heads", 4),
         win_tokens=n.get("win_tokens", 0),
+        block_acts=tuple(n.get("block_acts", [])), stream_act_at=tuple(n.get("stream_act_at", [])),
     )
 
     train_cfg = TrainCfg(
@@ -254,6 +310,8 @@ def LoadConfig(path):
         freeze_from=t.get("freeze_from", ""), freeze_below=t.get("freeze_below", 0),
         use_compile=t.get("use_compile", True),
         matmul_precision=t.get("matmul_precision", "high"),
+        half_gemm=t.get("half_gemm", "off"),
+        case_group=t.get("case_group", 1),
     )
 
     colloc_cfg = CollocCfg(
@@ -262,6 +320,9 @@ def LoadConfig(path):
         ic_sigma=c.get("ic_sigma", 0.0),
         ic_sigma_warmup=c.get("ic_sigma_warmup", 200),
         per_case=c.get("per_case", 8),
+        sched_period=c.get("sched_period", 0),
+        sched_modes=tuple(c.get("sched_modes", ["grid"])),
+        sched_sigmas=tuple(c.get("sched_sigmas", [])),
     )
 
     data_cfg = DataCfg(
@@ -277,6 +338,10 @@ def LoadConfig(path):
         data_path=d.get("data_path", d["nonflip_path"]),
         scaler_name=d["scaler_name"],
         scaler_extra_omega=d.get("scaler_extra_omega", ""),
+        batch_size_phase2=d.get("batch_size_phase2", 0),
+        label_path=d.get("label_path", ""), label_score_path=d.get("label_score_path", ""),
+        label_dt=d.get("label_dt", 0.0), label_dt_phase2=d.get("label_dt_phase2", 0.0),
+        label_dense_frac=d.get("label_dense_frac", 0.0), slide_frac=d.get("slide_frac", 0.0),
     )
 
     # 단위 주의: rel_tol_*은 에폭당 개선율 하한, patience_*는 에폭 수.

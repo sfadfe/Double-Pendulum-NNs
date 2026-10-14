@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 """
 - 입력 feats (N, feat_dim): [τ, sinθ1, cosθ1, sinθ2, cosθ2, ω1, ω2, param_embed(32)]
@@ -39,6 +40,14 @@ class ParamEmbed(nn.Module):
         return self.net(params_norm)
 
 
+def HalfLinear(lin, x):
+    # Linear with the GEMM in fp16, fp32 in and out (TrainCfg.half_gemm) // GEMM만 fp16, 입출력은 fp32
+    #   Only the residual-branch product is rounded; the skip stream h, the heads and the losses stay fp32.
+    #   Callers gate on torch.is_grad_enabled(): eval, marching and the rollout pushforward run fp32 (cf. trap 25).
+    #   The backward needs the loss scale of LambdaBalance._BwScale (trap 29).
+    return F.linear(x.half(), lin.weight.half(), lin.bias.half()).float()
+
+
 class FiLMCond(nn.Module):
     # (IC, param_embed) → 블록별 (γ, β) // 케이스가 trunk를 곱셈 변조한다
     #   zero-init + γ에 1을 더해 시작 시 항등(γ=1, β=0) — 학습 초반이 concat과 같은 출발선.
@@ -53,12 +62,27 @@ class FiLMCond(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, 2 * width * n_blocks),
         )
+        self.half = False   # last-layer GEMM in fp16 while grad is enabled (Networks.SetHalf) // 마지막 층 GEMM fp16
 
     def forward(self, c):
-        gb = self.net(c).view(-1, self.n_blocks, 2, self.width)
+        if self.half and torch.is_grad_enabled():
+            gb = HalfLinear(self.net[2], self.net[1](self.net[0](c)))
+        else:
+            gb = self.net(c)
+        gb = gb.view(-1, self.n_blocks, 2, self.width)
         gamma = 1.0 + gb[:, :, 0]
         beta = gb[:, :, 1]
         return gamma, beta
+
+
+class ZTanh(nn.Module):
+    # Even activation z·tanh(z) (2026-10-14, config.py block_acts): folds negatives to positive, ≈ z² near 0
+    #   (σ'(0) = 0, σ''(0) = 2), ≈ |z| far out. // 짝함수 활성 — 음수를 양수로 접는다. 0 근처 z², 멀리선 |z|
+    def forward(self, z):
+        return z * torch.tanh(z)
+
+
+_ACTS = {"silu": nn.SiLU, "ztanh": ZTanh}   # branch activations by config name // 가지 활성함수 이름표
 
 
 class FiLMBlock(nn.Module):
@@ -67,20 +91,32 @@ class FiLMBlock(nn.Module):
     #   구 gated 블록((1−z)u + zv + h 뒤 γ·h + β)은 skip까지 γ가 곱해져 깊이만큼 γ가 곱셈 증식했다.
     #   여기선 γ가 가지 하나에만 걸려 블록 야코비안이 I + O(γ)로 유계 → 좁고 깊게(256×12) 쌓는다.
     #   판정: FiLM-inside 256×12 > gated 384×6 (rollout 3.2×); τ 재주입(film_tau)은 3.9× 악화로 기각.
-    def __init__(self, hidden):
+    def __init__(self, hidden, act="silu"):
         super().__init__()
         self.fc1 = nn.Linear(hidden, hidden)
-        self.act = nn.SiLU()
+        self.act = _ACTS[act]()
+        self.half = False   # branch GEMM in fp16 while grad is enabled (Networks.SetHalf) // 가지 GEMM fp16
+
+    def Fc1(self, h):
+        if self.half and torch.is_grad_enabled():
+            return HalfLinear(self.fc1, h)
+        return self.fc1(h)
 
     def forward(self, h, gamma, beta):
-        return h + gamma * self.act(self.fc1(h)) + beta
+        a = self.act(self.Fc1(h))
+        if gamma.shape[0] != h.shape[0]:
+            # One (γ, β) row per case, h case-major with K rows per case (TrainCfg.case_group): broadcast over
+            # the K rows instead of repeating the cond. // 케이스당 (γ, β) 1행을 K행에 브로드캐스트
+            n, w = gamma.shape[0], h.shape[-1]
+            return (h.view(n, -1, w) + gamma.unsqueeze(1) * a.view(n, -1, w) + beta.unsqueeze(1)).view(-1, w)
+        return h + gamma * a + beta
 
 
 class FFNBlock(FiLMBlock):
     # FiLMBlock with γ≡1, β≡0 (correction-unit screen 2026-09-14) // 조건화 없는 같은 블록, 연산 동일
     #   Same fc1/act/1/√n scale and state-dict keys as FiLMBlock, so arm A−C measures "conditioning removed" only.
     def forward(self, h):
-        return h + self.act(self.fc1(h))
+        return h + self.act(self.Fc1(h))
 
 
 class AttnPoolBlock(nn.Module):
@@ -147,7 +183,7 @@ class XAttnBlock(FiLMBlock):
         att = torch.softmax(score, dim=-1)
         o = torch.einsum("nhmp,nphd->nmhd", att, v).reshape(-1, width)
         h = h + self.out(o)
-        return h + gamma * self.act(self.fc1(h)) + beta
+        return h + gamma * self.act(self.Fc1(h)) + beta
 
 
 class Networks(nn.Module):
@@ -170,6 +206,14 @@ class Networks(nn.Module):
         self.block_types = list(netCfg.block_types) or ["film"] * netCfg.n
         if len(self.block_types) != netCfg.n or any(t not in ("film", "ffn", "attn", "xattn") for t in self.block_types):
             raise ValueError(f"block_types must be {netCfg.n} of film/ffn/attn/xattn: {self.block_types}")
+        # Activation arms (2026-10-14, config.py block_acts / stream_act_at); () = all silu / no stream SiLU
+        # // 블록별 가지 활성함수, 스트림 전체 SiLU 경계 (stage_at과 같은 1-based)
+        self.block_acts = list(netCfg.block_acts) or ["silu"] * netCfg.n
+        if len(self.block_acts) != netCfg.n or any(a not in _ACTS for a in self.block_acts):
+            raise ValueError(f"block_acts must be {netCfg.n} of {'/'.join(_ACTS)}: {self.block_acts}")
+        self.stream_act_at = sorted(int(k) for k in netCfg.stream_act_at)
+        if any(k < 1 or k >= netCfg.n for k in self.stream_act_at):
+            raise ValueError(f"stream_act_at {self.stream_act_at} must lie in 1..n_blocks-1")
         self.film_slot, n_film = [], 0
         for t in self.block_types:                     # xattn carries a FiLM branch → consumes a (γ, β) slot
             self.film_slot.append(n_film if t in ("film", "xattn") else -1)
@@ -201,8 +245,8 @@ class Networks(nn.Module):
         self.film = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_film_a)
         if self.film_split_at > 0 and n_film > n_film_a:   # blocks ≥ split: own MLP, slots n_film_a.. (arm B: none)
             self.film_corr = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_film - n_film_a)
-        self.blocks = nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads)
-                                     for t in self.block_types])
+        self.blocks = nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, a)
+                                     for t, a in zip(self.block_types, self.block_acts)])
         self.head_theta = nn.Linear(width, 2)   # Δθ1, Δθ2 // option B1
         self.head_omega = nn.Linear(width, 2)   # ω1, ω2
 
@@ -236,6 +280,8 @@ class Networks(nn.Module):
         if self.win_tok > 0:
             self.win_enc = nn.Sequential(nn.Linear(4 * self.win_tok, width), nn.SiLU(), nn.Linear(width, width))
 
+        self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
+        self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)
         self.ResetParameters()
 
     def ResetParameters(self):
@@ -292,12 +338,26 @@ class Networks(nn.Module):
             nn.init.zeros_(film.net[-1].weight)
             nn.init.zeros_(film.net[-1].bias)
 
+    def SetHalf(self, mode):
+        # fp16 GEMMs (TrainCfg.half_gemm): "off" | "blk" (block branch fc1) | "blk+film" (+ FiLM last layer)
+        #   Plain attributes, not buffers: state_dict and checkpoints are unchanged. The compiled graphs guard on
+        #   them, so switching (RebalanceGradScales measures in fp32) compiles the other variant once.
+        # // 블록 가지 GEMM / FiLM 마지막 층 GEMM을 fp16으로. 속성 플래그라 체크포인트 불변
+        if mode not in ("off", "blk", "blk+film"):
+            raise ValueError(f"half_gemm {mode!r}")
+        for m in self.modules():
+            if isinstance(m, FiLMBlock):
+                m.half = mode != "off"
+            elif isinstance(m, FiLMCond):
+                m.half = mode == "blk+film"
+        self.half_mode = mode
+
     @staticmethod
-    def _MakeBlock(kind, width, attn_tokens, xattn_heads=4):
+    def _MakeBlock(kind, width, attn_tokens, xattn_heads=4, act="silu"):
         if kind == "film":
-            return FiLMBlock(width)
+            return FiLMBlock(width, act)
         if kind == "ffn":
-            return FFNBlock(width)
+            return FFNBlock(width, act)
         if kind == "xattn":
             return XAttnBlock(width, xattn_heads)
         return AttnPoolBlock(width, attn_tokens)
@@ -374,6 +434,13 @@ class Networks(nn.Module):
         gc, bc = self.film_corr(c)                     # 보정 구간 슬롯 (film_split_at 이후)
         return torch.cat([ga, gc], dim=1), torch.cat([ba, bc], dim=1)
 
+    def CaseCond(self, feats, n_q):
+        # CondOf for forward: one row per case when group_cond is on and the rows are case-major groups of n_q,
+        # else one per row. // group_cond면 케이스 대표행만 FiLM에 넣는다 (블록에서 브로드캐스트)
+        if self.group_cond and n_q > 1:
+            return self.CondOf(feats[::n_q])
+        return self.CondOf(feats)
+
     def forward(self, feats, cond=None, Stages=False, n_q=1, tok_hs=None):
         # cond: CondOf() 결과를 그대로 (N행 정렬) — None이면 여기서 행마다 계산 (기존 경로)
         # Stages: True면 (out, [x̂_k ...]) — 중간 단계 상태도 반환 (Loss의 stage 감독용). 기본 False = 종전
@@ -383,7 +450,7 @@ class Networks(nn.Module):
         # // xattn: 케이스당 질의 행 수. tok_hs가 있으면 토큰 행을 안 붙이고 그 상태를 K/V로 씀
 
         if cond is None:
-            cond = self.CondOf(feats)
+            cond = self.CaseCond(feats, n_q)
         if self.win_tok > 0 and tok_hs is None:          # 창 임베딩 z: 케이스당 1회 (토큰 행은 붙이지 않음)
             tok_hs = self.TokenStates(feats[::n_q], tuple(c[::n_q] for c in cond))
         append = self.n_tok > 0 and tok_hs is None
@@ -426,6 +493,8 @@ class Networks(nn.Module):
             else:
                 h = self.ApplyBlock(i, h, gammas, betas, n_q)   # film: FiLM이 잔차 가지 안에서만 변조
             pos = i + 1
+            if pos in self.stream_act_at:                           # whole stream through SiLU, no skip // 스트림 SiLU
+                h = F.silu(h)
             if st < len(self.stage_at) and self.stage_at[st] == pos:
                 a_cum = a_cum + self.stage_heads[st](h)          # 잔차 누적 (a-space)
                 x_k = self._HardIC(a_cum, feats, tau)             # 물리 상태 [Δθ, ω] (τ=0 항등 유지)

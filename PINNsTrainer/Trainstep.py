@@ -17,6 +17,10 @@ class LambdaBalance:
         self._term_gnorm = {}              # 항별 clip 직전 grad 노름 EMA(0.9/0.1) // _FlushTerm 진단
         self._grad_acc = None              # 항별 clip 누적 버퍼 — 최초 1회 할당 후 zero_()로 재사용 // _GradAcc
         self._colloc_ic_sigma = 0.0        # 물리 콜로케이션 IC 섭동 폭 (Phase 3, 매 에폭 램프) // off-manifold
+        self._colloc_mode = "grid"         # collocation mode of the epoch (CollocCfg.sched_modes) // loop에서 갱신
+        self._phase1 = True                # phase-1 mirror — DataBatchSize / LabelBatch stride // loop에서 갱신
+        self._bw_scale = {}                # 항별 backward 손실 스케일 (half_gemm) // _BwScale
+        self._bw_first = self.BW_FIRST     # 노름을 모르는 항의 첫 스텝 스케일 // BackoffBwScales가 함께 낮춘다
         # 고정 base 가중치 — 동적 조정은 grad_scale(RebalanceGradScales) 단독 담당.
         self._base_lambda = {
             "ic": c.lambda_ic, "data": c.lambda_data, "kin": c.lambda_kin,
@@ -113,12 +117,74 @@ class LambdaBalance:
                 a.zero_()
         return self._grad_acc
 
+    # --- half_gemm: backward loss scale per term // fp16 GEMM의 backward 언더플로 방지 ---
+    # The cotangents of a mean loss are ~1e-6 per row and underflow in an fp16 GEMM (film 256×12, epoch 583, same
+    #   batch: gradient cos against fp32 0.87 unscaled, 0.9998 scaled). So each term's loss is multiplied by a power
+    #   of two S before backward() and _FlushTerm divides it back out — both exact in fp32.
+    # S follows the term's pre-clip gradient norm g (the _term_gnorm EMA): S·g = BW_TARGET. Measured at init and at
+    #   epoch 583, all terms: precision is flat from S·g ≈ 2^7 up, fp16 overflows (non-finite grads) from S·g ≈ 2^21.
+    #   A fixed S cannot cover a run: g falls by ~2^10 from init to epoch 583.
+    # Schedule: a term's first step uses _bw_first (inside the window at init, where g is largest), its second step
+    #   reads its norm once, then UpdateBwScales refreshes every epoch. Not checkpointed — a resume re-derives it.
+    # // 항별 손실에 2의 거듭제곱 S를 곱해 backward, _FlushTerm에서 되돌린다. S·g = 2^12 유지 (창: 2^7 ~ 2^21)
+    BW_TARGET = 2.0 ** 12
+    BW_FIRST = 2.0 ** 7
+
+    def _BwScaleOf(self, g):
+        if not (math.isfinite(g) and g > 0.0):
+            return self._bw_first
+        return 2.0 ** min(30, max(-10, round(math.log2(self.BW_TARGET / g))))
+
+    def _BwScale(self, name):
+        # Same value at a term's backward() calls and at its flush: _term_gnorm only changes inside _FlushTerm,
+        #   after the scale was read. // 한 스텝 안에서 backward와 flush가 같은 값을 본다
+        if self.half_mode == "off" or name is None:
+            return 1.0
+        s = self._bw_scale.get(name)
+        if s is None:
+            g = self._term_gnorm.get(name)
+            if g is None:
+                return self._bw_first
+            s = self._bw_scale[name] = self._BwScaleOf(float(g))   # one host sync per term per run // 항당 1회
+        return s
+
+    def UpdateBwScales(self):
+        # Once per epoch (RunTrainLoop): one host sync per term (trap 20) // 에폭당 1회 갱신
+        if self.half_mode == "off":
+            return
+        self._bw_first = self.BW_FIRST
+        for k, v in self._term_gnorm.items():
+            self._bw_scale[k] = self._BwScaleOf(float(v))
+
+    def BackoffBwScales(self):
+        # A step with non-finite gradients may be an fp16 overflow (a term's gradient jumped > 2^9 above its EMA):
+        #   lower every scale by 2^8 until the next UpdateBwScales. The EMA skips non-finite norms, so without this
+        #   the same S would overflow again. // 비유한 grad 스텝 뒤 스케일을 2^8 낮춘다 (다음 에폭 갱신까지)
+        if self.half_mode == "off":
+            return False
+        self._bw_first = max(self._bw_first * 2.0 ** -8, 2.0 ** -10)
+        for k, v in self._term_gnorm.items():
+            if k not in self._bw_scale:
+                self._bw_scale[k] = self._BwScaleOf(float(v))
+        for k in self._bw_scale:
+            self._bw_scale[k] = max(self._bw_scale[k] * 2.0 ** -8, 2.0 ** -10)
+        return True
+
+    def _Backward(self, loss, name):
+        s = self._BwScale(name)
+        (loss if s == 1.0 else loss * s).backward(retain_graph=False)
+
     def _FlushTerm(self, acc, budget, name=None):
         # 직전 항의 .grad(청크 누적 완료분)를 clip → acc로 이관 → .grad 비움
         # clip_grad_norm_의 반환값 = clip 이전 노름 (공짜) — 항별 포화 여부 진단용 EMA로 축적.
         # rebalance(10에폭)를 기다리지 않고 매 스텝 실제 유효 크기를 볼 수 있다. // saturation probe
         # GPU 텐서로 유지 — float()를 걸면 항마다 host sync가 생긴다 (읽는 쪽에서 1회 변환).
-        pre = torch.nn.utils.clip_grad_norm_(self.parameters(), budget).detach()
+        # half_gemm: .grad holds S × gradient — clip against S × budget, record norm / S, accumulate with 1 / S
+        #   (S = 1 leaves every operation as it was). // S배 된 grad를 S배 예산으로 clip, 1/S로 누적
+        s = self._BwScale(name)
+        pre = torch.nn.utils.clip_grad_norm_(self.parameters(), budget * s).detach()
+        if s != 1.0:
+            pre = pre / s
         if name is not None:
             prev = self._term_gnorm.get(name)
             nxt = pre if prev is None else 0.9 * prev + 0.1 * pre
@@ -129,7 +195,10 @@ class LambdaBalance:
                 torch.isfinite(nxt), nxt, prev if prev is not None else zero)
         for p, a in zip(self.parameters(), acc):
             if p.grad is not None:
-                a.add_(p.grad)
+                if s == 1.0:
+                    a.add_(p.grad)
+                else:
+                    a.add_(p.grad, alpha=1.0 / s)
         # set_to_none=False: .grad 텐서를 살려둔 채 0으로만 비운다 → 다음 항의 backward가
         #   같은 버퍼에 누적(재할당 없음). set_to_none=True면 항마다 .grad를 새로 할당한다.
         self.optimizer.zero_grad(set_to_none=False)
@@ -171,7 +240,7 @@ class LambdaBalance:
             lk = self.KinLoss(feats, meta.get("n_q", 1))
             frac = (e - s) / n
             weighted = lam["kin"] * self.grad_scale["kin"] * self.kin_ramp * lk * frac
-            weighted.backward(retain_graph=False)
+            self._Backward(weighted, "kin")
             kin_acc = kin_acc + lk.detach() * frac
             metric_out[0] = metric_out[0] + weighted.detach()
         losses_out["kin"] = kin_acc
@@ -199,7 +268,7 @@ class LambdaBalance:
                     + lam["energy"] * self.grad_scale["energy"] * le
                 ) * pr
             ) * ((e - s) / n)
-            combo.backward(retain_graph=False)
+            self._Backward(combo, "phys")
             frac = (e - s) / n
             kin_acc = kin_acc + lk.detach() * frac
             phys_acc = phys_acc + lp.detach() * frac
@@ -227,7 +296,7 @@ class LambdaBalance:
                 )
                 frac = (e - s) / total_n
                 weighted = lam["ic"] * self.grad_scale["ic"] * lic * frac
-                weighted.backward(retain_graph=False)
+                self._Backward(weighted, "ic")
                 ic_acc = ic_acc + lic.detach() * frac
                 metric_out[0] = metric_out[0] + weighted.detach()
         losses_out["ic"] = ic_acc
@@ -245,7 +314,7 @@ class LambdaBalance:
 
         l_data = self.DataLoss(*batch)
         w_data = lam["data"] * self.grad_scale["data"] * l_data
-        w_data.backward(retain_graph=False)
+        self._Backward(w_data, "data")
         losses["data"] = l_data.detach()
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
@@ -278,7 +347,7 @@ class LambdaBalance:
 
         l_data = self.DataLoss(*batch)
         w_data = lam["data"] * self.grad_scale["data"] * l_data
-        w_data.backward(retain_graph=False)
+        self._Backward(w_data, "data")
         losses["data"] = l_data.detach()
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
@@ -295,7 +364,7 @@ class LambdaBalance:
             # roll도 grad_scale 경유 — 유일하게 밸런싱 밖에 있던 항. clip_grad_norm_은 전 항
             # 합산 뒤에 걸리므로 roll만 raw면 폭주 시 나머지 gradient가 소거됨 // 측정 근거는 _RobustRollMean
             w_roll = lam["roll"] * self.grad_scale["roll"] * self.roll_ramp * roll_loss
-            w_roll.backward(retain_graph=False)
+            self._Backward(w_roll, "roll")
             losses["roll"] = roll_loss.detach()
             metric_box[0] = metric_box[0] + w_roll.detach()
             self._FlushTerm(acc, budget, "roll")
@@ -306,6 +375,11 @@ class LambdaBalance:
     def RebalanceGradScales(self, n_batches=3, eps=1e-12):
         # B: 항목별 독립 forward-backward로 grad 노름 측정 // retain_graph 없이 peak VRAM 절약
         self.train()
+        # half_gemm: measure in fp32. The raw sub-term losses here have no backward scale of their own, and an
+        #   unscaled fp16 backward misreads the norm (phys ×1.25 measured). Compiles the fp32 graphs once.
+        # // 노름 측정은 fp32로 — 스케일 없는 fp16 backward는 노름이 틀린다
+        half_mode = self.half_mode
+        self.SetHalf("off")
         sums = {"data": 0.0, "kin": 0.0, "phys": 0.0, "energy": 0.0}
         if self.IcTermOn():
             sums["ic"] = 0.0
@@ -315,8 +389,14 @@ class LambdaBalance:
         chunk = self._LossChunk()
         for _ in range(n_batches):
             for t_lo, t_hi in self.segments:
-                frame = self.SegmentFrame(t_lo, t_hi)
-                batch = self.SegmentBatch(frame)
+                # same data batch as the training step: source, rows and stride of the current phase
+                # // 학습 스텝과 같은 data 배치 (라벨 소스·배치 크기·위상)
+                if self.dataCfg.label_path:
+                    frame = None
+                    batch = self.LabelBatch(t_lo, self.DataBatchSize())
+                else:
+                    frame = self.SegmentFrame(t_lo, t_hi)
+                    batch = self.SegmentBatch(frame, self.DataBatchSize())
                 # 아래에서 쓰는 건 part0의 앞 chunk행뿐 — 전체를 만들면 그대로 버려진다 // 측정 비용 절감
                 ic_parts = self.ICSamplesRaw(max_n=chunk) if self.IcTermOn() else None
                 colloc_meta = self.CollocationForBalance(t_lo, t_hi)
@@ -357,6 +437,7 @@ class LambdaBalance:
 
                 cnt += 1
                 del colloc_meta, batch, ic_parts, frame
+        self.SetHalf(half_mode)
         self.optimizer.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
 
@@ -401,10 +482,16 @@ class TimeMarching:
         n = n or self.collocCfg.n_colloc
         span = t_hi - t_lo
         tau = torch.rand(n, 1, device=self.device) * span
+        mode = getattr(self, "_colloc_mode", "grid")   # CollocCfg.sched_modes; "grid" = no change below // 에폭의 모드
+        if mode == "tau_end":
+            # every second row: density ∝ τ, span·√u with u = τ/span. Even rows stay uniform, so each case group
+            #   holds both kinds. // 홀수 행은 τ에 비례하는 밀도(창 끝 쪽), 짝수 행은 균등 그대로
+            tau[1::2] = (tau[1::2] * span).sqrt()
 
         # xattn nets: per_case rows share one case (case-major groups) so forward(n_q=per_case) can build the
         # window tokens once per case. n must be a multiple of per_case. // 케이스당 per_case개 τ 묶음
-        n_q = self.collocCfg.per_case if getattr(self, "n_tok", 0) > 0 else 1
+        # plain nets with TrainCfg.case_group: the same grouping, used to share the FiLM cond per case
+        n_q = self.collocCfg.per_case if getattr(self, "n_tok", 0) > 0 else self.CaseGroup()
         if n % n_q != 0:
             raise ValueError(f"n_colloc {n} must be a multiple of colloc per_case {n_q}")
         local_idx = torch.randint(0, len(case_pool), (n // n_q,), device=self.device).repeat_interleave(n_q)
@@ -417,6 +504,11 @@ class TimeMarching:
             ci = case_idx.cpu()
         else:
             ci = case_idx
+        if mode == "any":
+            # IC anchor = true state at a random saved time index, one per case group, up to the last window start
+            #   (the window stays inside the data span) // 앵커 시점을 격자 밖 임의 저장 시점으로 — 케이스(그룹)당 1개
+            i_last = self._WindowStartIdx(self.segments[-1][0])
+            i0 = torch.randint(0, i_last + 1, (n // n_q,), device=self.device).repeat_interleave(n_q).to(ci.device)
         ic_base = data[ci, i0][:, [1, 2, 3, 4]]
         if ic_base.device != self.device:
             ic_base = ic_base.to(self.device)
@@ -432,6 +524,28 @@ class TimeMarching:
             ic_state = ic_base
         e0 = self.GetEnergy(ic_state.float(), params.float()).detach()   # FP32 (Loss.py 주석)
         return {"tau": tau, "ic_state": ic_state, "params": params, "e0": e0, "n_q": n_q}
+
+    COLLOC_MODES = ("grid", "any", "tau_end")
+
+    def CollocSchedAt(self, epoch, warmup_epochs):
+        # Collocation schedule (CollocCfg.sched_*): (mode, sigma target, sigma) of an epoch. RunTrainLoop mirrors mode
+        #   and sigma onto _colloc_mode / _colloc_ic_sigma, so the training draw and RebalanceGradScales share them.
+        #   Target k = 0 ramps like ic_sigma (0 → target over ic_sigma_warmup epochs after phase-2 entry); k ≥ 1 ramps
+        #   linearly from target k−1 over ic_sigma_warmup epochs after its switch epoch. Phase 1 stays at 0.
+        # // 에폭의 (모드, sigma 목표, sigma). 모드는 sched_period마다 순환, sigma 목표는 모드 한 바퀴마다 다음 값
+        c = self.collocCfg
+        modes = c.sched_modes
+        sigmas = c.sched_sigmas or (c.ic_sigma,)
+        cycle = c.sched_period * len(modes)
+        mode = modes[(epoch // c.sched_period) % len(modes)]
+        k = min(epoch // cycle, len(sigmas) - 1)
+        if epoch < warmup_epochs:
+            return mode, sigmas[k], 0.0
+        warm = max(c.ic_sigma_warmup, 1)
+        if k == 0:
+            return mode, sigmas[0], sigmas[0] * min(1.0, (epoch - warmup_epochs) / warm)
+        frac = min(1.0, (epoch - k * cycle) / warm)
+        return mode, sigmas[k], sigmas[k - 1] + (sigmas[k] - sigmas[k - 1]) * frac
 
     def SetupCollocCases(self, n_colloc=None, flip_bias=0.0):
         # flip finetune: flip-biased colloc_cases 고정(stratified) // 명시적 is_flip balancing
@@ -537,6 +651,7 @@ class TimeMarching:
 
     def _RollForwardImpl(self, feats, n_points):
         n = feats.shape[0] // n_points
-        cond = tuple(c.repeat_interleave(n_points, dim=0)
-                     for c in self.CondOf(feats[::n_points]))      # 케이스 대표행 (case-major)
+        cond = self.CondOf(feats[::n_points])                      # 케이스 대표행 (case-major)
+        if not self.group_cond:                                    # group_cond: 블록이 케이스 행을 브로드캐스트
+            cond = tuple(c.repeat_interleave(n_points, dim=0) for c in cond)
         return self(feats, cond=cond, n_q=n_points).reshape(n, n_points, 4)

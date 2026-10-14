@@ -1,0 +1,31 @@
+# hipBLASLt kernel pins for the FiLM last-layer GEMMs on gfx1201 (R9700) // gfx1201에서 FiLM 마지막 층 GEMM의 커널 고정
+#   NN rows: backward G @ W (m 128 = film_hidden; n = rows; k = 2 * width * blocks). NT rows: weight grad G^T @ u.
+#   The library default for these shapes runs at 11-13 TFLOPS; the pinned shipped kernels at 19-24. // 기본 선택 11-13 TFLOPS → 고정 커널 19-24
+#   Indices come from a TunableOp search (2026-10-11) and belong to the build on the Git Version line;
+#   rows are ignored by any other build - re-tune after a torch / ROCm update. // 다른 빌드에서는 무시된다 - 라이브러리 갱신 후 재튜닝
+#   compute_type f32_r = matmul_precision "highest"; under "high" no row matches. // "high"에서는 어느 행도 맞지 않는다
+Git Version: 3d8f334b
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,4096,6144,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,6144,4096,f32_r,f32_r,f32_r,f32_r,140505
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,16384,6144,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,6144,16384,f32_r,f32_r,f32_r,f32_r,140505
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,4096,5120,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,5120,4096,f32_r,f32_r,f32_r,f32_r,140505
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,16384,5120,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,5120,16384,f32_r,f32_r,f32_r,f32_r,140505
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,4096,3072,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,3072,4096,f32_r,f32_r,f32_r,f32_r,140505
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,N,1,128,16384,3072,f32_r,f32_r,f32_r,f32_r,140581
+transA,transB,batch_count,m,n,k,a_type,b_type,c_type,compute_type,solution_index
+N,T,1,128,3072,16384,f32_r,f32_r,f32_r,f32_r,140505

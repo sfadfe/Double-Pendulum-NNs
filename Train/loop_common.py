@@ -536,6 +536,14 @@ def RunTrainLoop(
 
     IC_MAX_N = train_cfg.ic_max_n or None   # 0 → 전체 (구 config 하위호환) // per-step IC 케이스 상한
 
+    # Schedule switches, all off by default (config.py CollocCfg.sched_*, DataCfg.label_* / batch_size_phase2)
+    # // 스케줄 스위치 — 기본값이면 전부 False, 아래 종전 경로 그대로
+    COLLOC_SCHED = trainer.collocCfg.sched_period > 0
+    USE_LABEL = bool(data_cfg.label_path)
+    DATA_SCHED = USE_LABEL or data_cfg.batch_size_phase2 > 0
+    colloc_said = None      # (mode, sigma target) of the last [colloc] line // 바뀔 때만 출력
+    data_said = None        # phase of the last [data] line
+
     PHYS_RAMP_CENTER = train_cfg.phys_ramp_center
     PHYS_RAMP_WIDTH = max(train_cfg.phys_ramp_width, 1)
     LR_DROP_EPOCH = train_cfg.lr_drop_epoch
@@ -614,11 +622,13 @@ def RunTrainLoop(
                 roll_anchor = DATA_WARMUP_EPOCHS + ROLL_DELAY
             roll_on = roll_enabled and not phase1 and epoch >= roll_anchor
             trainer._roll_active = roll_on          # RebalanceGradScales가 roll 측정 여부 판단
+            trainer._phase1 = phase1                # DataBatchSize / LabelBatch의 위상 (스텝·밸런서 공용)
             if roll_on:
                 trainer.roll_ramp = min(1.0, (epoch - roll_anchor + 1) / max(ROLL_RAMP, 1))
                 trainer._roll_depth = max(1, min(ROLL_DEPTH_MAX, 1 + (epoch - roll_anchor) // ROLL_DEPTH_RAMP))
 
             hooks.OnEpochStart(trainer, epoch, phase1, ode_sched, t_params)
+            trainer.UpdateBwScales()   # half_gemm: 항별 backward 손실 스케일 갱신 (off면 no-op)
             if epoch == DATA_WARMUP_EPOCHS:
                 ode_sched.DropOnPhase2(epoch)
                 # phase1 데이터피팅으로 바닥친 val_best/best.pt 선택 지표 리셋 —
@@ -642,6 +652,18 @@ def RunTrainLoop(
                     trainer.phys_ramp = 0.0
             else:
                 trainer.phys_ramp = 0.0
+
+            if COLLOC_SCHED:
+                # epoch's collocation mode and sigma (replaces the ic_sigma ramp above); set before the rebalance
+                #   below so its draw uses them too // 에폭의 콜로케이션 모드·sigma — 밸런서 추첨도 같은 값
+                c_mode, c_target, trainer._colloc_ic_sigma = trainer.CollocSchedAt(epoch, DATA_WARMUP_EPOCHS)
+                trainer._colloc_mode = c_mode
+                if (c_mode, c_target) != colloc_said:
+                    colloc_said = (c_mode, c_target)
+                    tqdm.write(f"[colloc] epoch {epoch} mode={c_mode} sigma={c_target:g}")
+            if DATA_SCHED and data_said != phase1:
+                data_said = phase1
+                tqdm.write(f"[data] epoch {epoch} {trainer.DataDesc()}")
 
             # A1: kin(헤드 커플러)는 epoch 0부터 0→1 램프, phys_ramp와 독립 상시 활성
             trainer.kin_ramp = min(1.0, (epoch + 1) / KIN_RAMP_EPOCHS)
@@ -701,11 +723,14 @@ def RunTrainLoop(
                         + " ".join(f"{k}={float(v):.2e}" for k, v in tg.items()))
 
             for t_lo, t_hi in trainer.segments:
-                frame = trainer.SegmentFrame(t_lo, t_hi)
-                bs = min(data_cfg.batch_size, frame["n_total"])
+                if USE_LABEL:   # fine labels: drawn per step from the label array, no SegmentFrame // 촘촘한 라벨 소스
+                    frame, bs = None, trainer.DataBatchSize()
+                else:
+                    frame = trainer.SegmentFrame(t_lo, t_hi)
+                    bs = min(trainer.DataBatchSize(), frame["n_total"])
 
                 for _ in range(t_params["steps_per_segment"]):
-                    batch = trainer.SegmentBatch(frame, bs)
+                    batch = trainer.LabelBatch(t_lo, bs) if USE_LABEL else trainer.SegmentBatch(frame, bs)
                     # hard_ic면 IC 잔차가 항등적으로 0 — 샘플링 자체를 건너뛴다 // 스텝 비용 회수
                     ic_parts = trainer.ICSamplesRaw(max_n=IC_MAX_N) if ic_term_on else []
                     # colloc은 Phase 1에서도 샘플 — kin 커플러를 데이터피팅과 함께 조기 학습 // A1
@@ -739,9 +764,13 @@ def RunTrainLoop(
                     if not (math.isfinite(metric_f) and math.isfinite(gnorm_f)):
                         trainer.optimizer.zero_grad()
                         nan_keys = [k for k, v in losses.items() if not math.isfinite(float(v))]
+                        grad_only = not nan_keys   # 손실은 유한, grad만 비유한 // half_gemm backward 오버플로 후보
                         if not nan_keys:
                             nan_keys = [f"grad-only(‖g‖={gnorm_f:.3e})"]
                         print(f"[NaN] skipping step — affected: {nan_keys}")
+                        # 손실 자체가 비유한이면 forward 문제라 backward 스케일을 낮춰도 소용없다 (trap 29)
+                        if grad_only and trainer.BackoffBwScales():
+                            print("[half] backward loss scale lowered by 2^8 until the next epoch")
                         step += 1
                         continue
 

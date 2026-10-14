@@ -1,5 +1,6 @@
 import torch
 import torch.func as tf
+from .GraphPass import JointPass
 
 class Loss:
     # --- torch.compile 게이트 // trainCfg.use_compile ---
@@ -24,6 +25,10 @@ class Loss:
             # // ZeroTensor 버퍼 재사용 크래시 우회 (trap 27) — jvp 없는 data/ic 그래프에도
             # 걸리지만 비용은 alloc 재사용 손실뿐이고 캐싱 할로케이터가 흡수한다.
             torch._inductor.config.allow_buffer_reuse = False
+            # jvp의 weight tangent 0과의 GEMM(h·dWᵀ, dW = 0)을 그래프에서 접고, FiLM 넓은 텐서의 복사와
+            # 저장 activation을 줄인다 — 수학 동일, 스텝 81.3 → 72.2 → 66.9 ms (R9700, 2026-10-12).
+            # // GraphPass.JointPass
+            torch._inductor.config.joint_custom_pre_pass = JointPass()
             cache[key] = torch.compile(fn, dynamic=False)
         return cache[key]
 
@@ -46,7 +51,7 @@ class Loss:
         # β = gb[:, :, 1] is a non-dense view; forward AD requires primal and tangent to share a
         # layout through view ops (unbind) — contiguous copy (N·n·width, memory-bound, ~0.1 ms).
         # // primal/tangent 레이아웃 불일치 → forward-AD 뷰 연산 assert. contiguous로 통일
-        cond = tuple(c.contiguous() for c in self.CondOf(feats.float()))
+        cond = tuple(c.contiguous() for c in self.CaseCond(feats.float(), n_q))
         # xattn: window-token streams are query-independent → computed here once per case (outside
         # the jvp, still in the backward graph) and passed as zero-tangent primals. The forward-AD then runs on
         # the query rows only (token rows inside the jvp cost 7× on the kin term). // 토큰 상태는 jvp 밖에서

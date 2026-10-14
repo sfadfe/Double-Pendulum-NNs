@@ -26,4 +26,7 @@ sympy==1.14.0
 torch==2.12.0
 tqdm==4.67.3
 typing_extensions==4.15.0
-# (ROCm 10.0.0 버전으로 해야함)
+# ROCm: nightly 10.2.0a20261009 torch + rocm_sdk_libraries/rocm_sdk_device_gfx1201 10.2.0a20261010 overlay
+#   (stable 10.0.0/10.1.0 lacks hipBLASLt gfx1201 fp32 tables → fp32 GEMM 2.8 TFLOPS)
+#   uv pip install --index-url https://nightly.repo.amd.com/rocm/whl-next/ --pre "torch[device-gfx1201]==2.12.0+rocm10.2.0a20261009"
+#   uv pip install --no-deps rocm_sdk_libraries==10.2.0a20261010 rocm_sdk_device_gfx1201==10.2.0a20261010 (same index)

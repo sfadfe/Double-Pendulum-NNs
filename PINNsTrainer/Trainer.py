@@ -20,7 +20,24 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.device = torch.device(device)
         self.device_type = self.device.type
         self.g = data_cfg.g
+        self.SetHalf(train_cfg.half_gemm)
+        # case_group: plain nets only (xattn / window-token nets group rows by their own n_q plumbing)
+        k = train_cfg.case_group
+        self.group_cond = k > 1 and self.n_tok == 0
+        if self.group_cond and (colloc_cfg.n_colloc % k or data_cfg.colloc_chunk % k or data_cfg.batch_size % k):
+            raise ValueError(f"case_group {k} must divide n_colloc, colloc_chunk and batch_size")
+        if data_cfg.batch_size_phase2 < 0 or (self.group_cond and data_cfg.batch_size_phase2 % k):
+            raise ValueError(f"batch_size_phase2 {data_cfg.batch_size_phase2} must be 0 or a multiple of case_group {k}")
+        bad = [m for m in colloc_cfg.sched_modes if m not in self.COLLOC_MODES]
+        if bad or not colloc_cfg.sched_modes or colloc_cfg.sched_period < 0 or any(s < 0 for s in colloc_cfg.sched_sigmas):
+            raise ValueError(f"[colloc] sched_period {colloc_cfg.sched_period} / sched_modes {colloc_cfg.sched_modes} / "
+                             f"sched_sigmas {colloc_cfg.sched_sigmas}: modes must be from {self.COLLOC_MODES}, "
+                             "period and sigmas ≥ 0")
         self.to(self.device)
+
+    def CaseGroup(self):
+        # rows per case in the colloc / data batches (1 = iid rows) // 케이스당 행 수
+        return self.trainCfg.case_group if self.group_cond else 1
 
     def SetupFinetune(self, base_dir, run_dir, pretrain_dir, seed=42):
         # Mixed data + replay buffer + frozen pretrain scaler // 파인튜닝 초기화
@@ -47,6 +64,7 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
 
         self.t_grid = self.t_grid.to(self.device)
         self.dt = float(self.t_grid[1] - self.t_grid[0])
+        self.LoadLabels(base_dir)   # DataCfg.label_path ("" = no-op) // 촘촘한 라벨 소스
         t_min = float(self.t_grid[0])
         t_max = float(self.t_grid[-1])
         self.BuildSegments(t_min, t_max)
@@ -125,6 +143,7 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.params_raw = self.params_raw.to(self.device)
         self.t_grid = self.t_grid.to(self.device)
         self.dt = float(self.t_grid[1] - self.t_grid[0])
+        self.LoadLabels(base_dir)   # DataCfg.label_path ("" = no-op) // 촘촘한 라벨 소스
 
         t_min = float(self.t_grid[0])
         t_max = float(self.t_grid[-1])

@@ -21,6 +21,8 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.device_type = self.device.type
         self.g = data_cfg.g
         self.SetHalf(train_cfg.half_gemm)
+        if train_cfg.roll_target not in ("label", "rk4"):
+            raise ValueError(f"roll_target {train_cfg.roll_target!r}")
         # case_group: plain nets only (xattn / window-token nets group rows by their own n_q plumbing)
         k = train_cfg.case_group
         self.group_cond = k > 1 and self.n_tok == 0

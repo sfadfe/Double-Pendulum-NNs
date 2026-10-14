@@ -1,4 +1,30 @@
+import math
+
 import torch
+
+
+def Rk4Window(f, state, params, taus, dt):
+    # Batched RK4 from `state` at τ=0 to each of the ascending `taus` // 배치 RK4: τ=0의 state에서 오름차순 taus 각각까지 적분
+    # f(state, params) -> d(state)/dt (Physics.ODE) ; state (n,4) [θ1,ω1,θ2,ω2] ; params (n,4) [m1,m2,L1,L2]
+    # taus: python floats ; each interval takes n_sub equal substeps h ≤ dt ; returns (n, P, 4)
+    # taus and dt are python constants, so the loops unroll into one static graph under torch.compile(dynamic=False).
+    # // taus·dt가 python 상수라 루프가 전부 풀려 정적 그래프 1개가 된다 (데이터 의존 분기 없음)
+    out = []
+    t_prev = 0.0
+    x = state
+    for t in taus:
+        # 1 - 1e-6: an interval that is k·dt up to float32 rounding of the grid must give k, not k+1 // 격자 반올림 여유
+        n_sub = max(1, math.ceil((t - t_prev) / dt * (1.0 - 1e-6)))
+        h = (t - t_prev) / n_sub
+        for _ in range(n_sub):
+            k1 = f(x, params)
+            k2 = f(x + (0.5 * h) * k1, params)
+            k3 = f(x + (0.5 * h) * k2, params)
+            k4 = f(x + h * k3, params)
+            x = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        out.append(x)
+        t_prev = t
+    return torch.stack(out, dim=1)
 
 
 class Physics:

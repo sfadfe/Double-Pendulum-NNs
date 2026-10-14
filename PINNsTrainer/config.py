@@ -134,6 +134,12 @@ class TrainCfg:
     #   (tail grad ∝ √(δ/l)) — Cauchy가 tail gradient를 끊어 flip 평균을 악화시킨 것의 완화
     #   후보. δ/c = roll_robust_k × median 공용. // [[rollout-tail-cauchy-tradeoff]]
     roll_robust_kind: str = "cauchy"
+    # Target of the roll grad window: "label" = stored trajectory, "rk4" = RK4 over the window from the marched IC
+    #   (ODE.Rk4Window, substep ≤ roll_rk4_dt). The stored label also holds the chaos-amplified IC error, which the
+    #   detached pushforward cannot reduce; "rk4" leaves only the net's own one-window error — trap 31.
+    #   // roll 타깃: "label" = 참 궤적, "rk4" = 마칭 IC에서 RK4로 적분한 한 창 (넷 자체 오차만 남김)
+    roll_target: str = "label"
+    roll_rk4_dt: float = 0.005
     # Drop the top-q fraction of rows (by per-row loss) from each term's gradient (0 = plain mean) // 손실 상위 q 행을
     #   grad에서 제외. 상위 소수 행이 손실·grad 노이즈를 지배해서. 분위는 청크(배치)별.
     trim_q_data: float = 0.0
@@ -303,6 +309,7 @@ def LoadConfig(path):
         roll_draws=t.get("roll_draws", 1),
         roll_median_ema=t.get("roll_median_ema", 0.0),
         roll_robust_kind=t.get("roll_robust_kind", "cauchy"),
+        roll_target=t.get("roll_target", "label"), roll_rk4_dt=t.get("roll_rk4_dt", 0.005),
         trim_q_data=t.get("trim_q_data", 0.0), trim_q_phys=t.get("trim_q_phys", 0.0),
         trim_q_kin=t.get("trim_q_kin", 0.0),
         roll_balance_points=t.get("roll_balance_points", 12),

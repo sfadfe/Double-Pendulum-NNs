@@ -1,6 +1,7 @@
 import torch
 import torch.func as tf
 from .GraphPass import JointPass
+from .ODE import Rk4Window
 
 class Loss:
     # --- torch.compile 게이트 // trainCfg.use_compile ---
@@ -263,15 +264,36 @@ class Loss:
         out = self._RollForward(feats, p)                          # (n,P,4) with grad, 케이스별 FiLM
         theta_pred = state[:, [0, 2]].unsqueeze(1) + out[:, :, :2]
         omega_pred = out[:, :, 2:]
-        grid_idx = grid.cpu() if data.device != self.device else grid
-        seg = data[ci.unsqueeze(1), grid_idx]                      # (n,P,5)
-        if seg.device != self.device:
-            seg = seg.to(self.device)
-        theta_true = seg[:, :, [1, 3]]
-        omega_true = seg[:, :, [2, 4]]
+        if self.trainCfg.roll_target == "rk4":
+            ref = self._RollRk4Target(state, params, off, (n_seg, n_points))
+            theta_true, omega_true = ref[:, :, [0, 2]], ref[:, :, [1, 3]]
+        else:
+            grid_idx = grid.cpu() if data.device != self.device else grid
+            seg = data[ci.unsqueeze(1), grid_idx]                  # (n,P,5)
+            if seg.device != self.device:
+                seg = seg.to(self.device)
+            theta_true = seg[:, :, [1, 3]]
+            omega_true = seg[:, :, [2, 4]]
         return ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
             (omega_pred - omega_true) ** 2
         ).mean(dim=(1, 2))
+
+    def _RollRk4Target(self, state, params, off, key):
+        # roll_target="rk4": target of the grad window = RK4 over the window from the marched IC, Φ(x̂_n), instead of
+        # the stored trajectory x_{n+1} = Φ(x_n). pred − x_{n+1} = [pred − Φ(x̂_n)] + [Φ(x̂_n) − Φ(x_n)]; the second
+        # term is the chaos-amplified IC error, and the pushforward is detached, so the grad window cannot reduce it.
+        # // 타깃을 참 라벨 대신 마칭 IC에서의 RK4 한 창으로. 참 라벨과의 차에 든 IC 오차 증폭분은 마칭이 detach라
+        # grad 창이 줄일 수 없는 성분이고, 이 타깃은 넷 자체의 한 창 오차만 남긴다.
+        # off: (P,) grid offsets inside the window. key = (n_seg, n_points) fixes them, so the host read and the
+        # compile run once per key (trap 31). Returns (n,P,4) [θ1,ω1,θ2,ω2], fp32, no grad.
+        taus_of = self.__dict__.setdefault("_roll_rk4_taus", {})
+        if key not in taus_of:
+            taus_of[key] = tuple(o * self.dt for o in off.tolist())
+        taus = taus_of[key]
+        h = float(self.trainCfg.roll_rk4_dt)
+        fn = self._Compiled(("roll_rk4", taus, h), lambda s, p: Rk4Window(self.ODE, s, p, taus, h))
+        with torch.no_grad():
+            return fn(state.float(), params.float())
 
     def _RolloutPerCase(self, case_idx, depth, n_points, k0=None):
         # Pushforward (Brandstetter+ 2022): roll `depth` windows under no_grad to reach the
@@ -327,12 +349,16 @@ class Loss:
         out = self._RollWindow(case_idx, params, state, tau)       # (n,P,4) [Δθ,ω] with grad
         theta_pred = state[:, [0, 2]].unsqueeze(1) + out[:, :, :2]  # 절대각 = 윈도우 시작각 + Δθ
         omega_pred = out[:, :, 2:]
-        grid_idx = grid.cpu() if data.device != self.device else grid
-        seg = data[ci][:, grid_idx]
-        if seg.device != self.device:
-            seg = seg.to(self.device)
-        theta_true = seg[:, :, [1, 3]]
-        omega_true = seg[:, :, [2, 4]]
+        if self.trainCfg.roll_target == "rk4":
+            ref = self._RollRk4Target(state, params, grid - i_start, (i_end - i_start, n_points))
+            theta_true, omega_true = ref[:, :, [0, 2]], ref[:, :, [1, 3]]
+        else:
+            grid_idx = grid.cpu() if data.device != self.device else grid
+            seg = data[ci][:, grid_idx]
+            if seg.device != self.device:
+                seg = seg.to(self.device)
+            theta_true = seg[:, :, [1, 3]]
+            omega_true = seg[:, :, [2, 4]]
         return ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
             (omega_pred - omega_true) ** 2
         ).mean(dim=(1, 2))

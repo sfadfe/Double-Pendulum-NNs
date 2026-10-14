@@ -100,10 +100,17 @@ class Dataset:
     def _BuildFeats(self, tau, params_raw, ic_state):
         # Flow-map features // 플로우맵 입력: τ + IC(trig,ω) + ParamEmbed(m,L)
         # params_raw는 호출자가 활성 소스에서 직접 해석해 전달 // explicit params, no hidden _replay_active dep
-        trig = self.GetTrigs(ic_state)
-        omega = ic_state[:, [1, 3]] / self.omega_rms
         pn = self.NormParams(params_raw)
         p_emb = self.param_embed(pn)  # Networks.ParamEmbed // option B3
+        return self._FeatsOf(tau, ic_state, p_emb)
+
+    def _FeatsOf(self, tau, ic_state, p_emb):
+        # _BuildFeats with the param embedding given — case-constant, so the roll pushforward computes it once per
+        # step (Trainstep._RollRound). ω columns 1, 3 as the slice 1::2: an eager list index [1, 3] copies a CPU index
+        # tensor to the GPU on every call (~47 µs, R9700 2026-10-15). Same values.
+        # // param_embed를 받아 feats 조립. 리스트 인덱스 대신 같은 열의 slice (호출마다 H2D 복사 제거)
+        trig = self.GetTrigs(ic_state)
+        omega = ic_state[:, 1::2] / self.omega_rms
         return torch.cat([tau, trig, omega, p_emb], dim=1)
 
     @torch.no_grad()

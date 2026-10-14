@@ -236,15 +236,14 @@ class Loss:
             state = state.to(self.device)
         params = self._ParamsAt(case_idx)
 
-        tau_end = torch.full((1, 1), md, device=dev)
-        alive = depth_c.unsqueeze(1)                               # (n,1) — round t 진행 조건 depth > t
         with torch.no_grad():
-            for t in range(max_depth):
-                out = self._RollWindow(case_idx, params, state, tau_end)   # (n,1,4) [Δθ,ω]
-                last = out[:, -1, :]
-                th_abs = state[:, [0, 2]] + last[:, :2]
-                nxt = torch.stack([th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1)
-                state = torch.where(alive > t, nxt, state)         # depth를 다 쓴 케이스는 고정
+            # case-constant feats once per step, then one compiled round per window (Trainstep._RollRound)
+            # // 케이스 상수 열(τ, param_embed)은 스텝당 1회, 라운드는 compile 1개
+            tau_col = torch.full((state.shape[0], 1), md, device=dev)
+            p_emb = self.param_embed(self.NormParams(params))
+            rem = depth_c.unsqueeze(1)                             # (n,1) 남은 라운드 — ≤ 0이면 고정
+            for _ in range(max_depth):
+                state, rem = self._RollRound(state, p_emb, tau_col, rem)
         state = state.detach()
 
         kg_c = k0_c + depth_c

@@ -79,6 +79,18 @@ class NetCfg:
     # // block_acts: 블록별 가지 활성함수 (ztanh = 짝함수). stream_act_at: 그 블록 뒤에서 스트림 전체에 SiLU 1회 (skip 없음)
     block_acts: tuple = ()
     stream_act_at: tuple = ()
+    # Per-case Fourier amplitude exponent (2026-10-15, branch RFF-Alternativen). "exp": φ_k(τ) → g_k·φ_k(τ),
+    #   g_k = (f_k/f_ref)^m(c), m(c) = fourier_m_max·tanh(MLP(cond)) — one exponent per case/window from the FiLM
+    #   input (IC + param_embed), shared by the sin/cos pair of f_k. The τ-derivative of feature k then scales as
+    #   f_k^(1+m): m < 0 damps the high band (nonflip windows, data power < 3.5 Hz while the first layer took 78 % of
+    #   dz/dτ from 8–20 Hz), m ≈ 0 keeps today's net. Last layer zero-init → m = 0, g = 1: equal to "off" at init and
+    #   after loading an "off" checkpoint (_AdaptState keeps the new keys at init). freqs untouched (trap 17).
+    #   fourier_f_ref 0 = √(f_min·f_max). "off" = no module, state_dict unchanged.
+    # // 케이스별 Fourier 진폭 지수: g_k = (f_k/f_ref)^m(c). m<0이면 미분 증폭 f^(1+m)로 고대역 감쇠. zero-init → 시작 시 off와 동일
+    fourier_gate: str = "off"
+    fourier_f_ref: float = 0.0
+    fourier_m_max: float = 1.0
+    fourier_gate_hidden: int = 32
 
     @property
     def gx_dim(self) -> int:
@@ -284,6 +296,8 @@ def LoadConfig(path):
         xattn_tokens=n.get("xattn_tokens", 8), xattn_heads=n.get("xattn_heads", 4),
         win_tokens=n.get("win_tokens", 0),
         block_acts=tuple(n.get("block_acts", [])), stream_act_at=tuple(n.get("stream_act_at", [])),
+        fourier_gate=n.get("fourier_gate", "off"), fourier_f_ref=n.get("fourier_f_ref", 0.0),
+        fourier_m_max=n.get("fourier_m_max", 1.0), fourier_gate_hidden=n.get("fourier_gate_hidden", 32),
     )
 
     train_cfg = TrainCfg(

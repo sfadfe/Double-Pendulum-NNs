@@ -279,6 +279,17 @@ class Networks(nn.Module):
         self.win_enc = None
         if self.win_tok > 0:
             self.win_enc = nn.Sequential(nn.Linear(4 * self.win_tok, width), nn.SiLU(), nn.Linear(width, width))
+        # Per-case Fourier amplitude exponent (config.py fourier_gate): m(c) rides on the cond tuple as (γ, β, m) and
+        #   _Core scales φ_k by (f_k/f_ref)^m. Built last, so the init draws of every module above are unchanged.
+        # // 케이스별 진폭 지수 헤드. 마지막에 생성 → 위 모듈들의 초기화 난수 불변
+        if netCfg.fourier_gate not in ("off", "exp"):
+            raise ValueError(f"fourier_gate {netCfg.fourier_gate!r}")
+        self.fourier_gate = None
+        if netCfg.fourier_gate == "exp":
+            gh = netCfg.fourier_gate_hidden
+            self.fourier_gate = nn.Sequential(nn.Linear(netCfg.cond_dim, gh), nn.SiLU(), nn.Linear(gh, 1))
+            self.fourier_f_ref = netCfg.fourier_f_ref or (netCfg.f_min * netCfg.f_max) ** 0.5
+            self.fourier_m_max = netCfg.fourier_m_max
 
         self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
         self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)
@@ -337,6 +348,11 @@ class Networks(nn.Module):
                 continue
             nn.init.zeros_(film.net[-1].weight)
             nn.init.zeros_(film.net[-1].bias)
+
+        # Fourier gate output zero-init → m = 0, g = 1 (after the Kaiming loop) // 진폭 지수 0에서 출발
+        if self.fourier_gate is not None:
+            nn.init.zeros_(self.fourier_gate[-1].weight)
+            nn.init.zeros_(self.fourier_gate[-1].bias)
 
     def SetHalf(self, mode):
         # fp16 GEMMs (TrainCfg.half_gemm): "off" | "blk" (block branch fc1) | "blk+film" (+ FiLM last layer)
@@ -427,12 +443,30 @@ class Networks(nn.Module):
         # (feats[:, 1:] only), so callers that evaluate many τ per case (rollout) or differentiate
         # in τ (jvp) compute it once and pass it to forward(cond=).
         # // FiLM 조건을 케이스 단위로 1회 계산해 forward(cond=)에 넘기기 위한 진입점
+        # fourier_gate "exp": (γ, β, m) with m (N, 1) — callers must treat cond as a tuple, not unpack two.
+        # // 게이트가 켜지면 (γ, β, m) 3원소 — 호출부는 2개 언패킹 금지, 튜플째로 넘긴다
         c = feats[:, 1:]
         if self.film_corr is None:
-            return self.film(c)
+            return self.film(c) + self.GateExp(c)
         ga, ba = self.film(c)                          # 예측 구간 슬롯
         gc, bc = self.film_corr(c)                     # 보정 구간 슬롯 (film_split_at 이후)
-        return torch.cat([ga, gc], dim=1), torch.cat([ba, bc], dim=1)
+        return torch.cat([ga, gc], dim=1), torch.cat([ba, bc], dim=1), *self.GateExp(c)
+
+    def GateExp(self, c):
+        # () or (m,), m = m_max·tanh(MLP(c)) ∈ (−m_max, m_max) // 진폭 지수 m(c), 게이트 없으면 빈 튜플
+        if self.fourier_gate is None:
+            return ()
+        return (self.fourier_m_max * torch.tanh(self.fourier_gate(c)),)
+
+    def GateFourier(self, emb_t, m):
+        # φ_k → (f_k/f_ref)^m·φ_k; sin and cos of f_k share g_k. m has one row per case under case_group (n < N)
+        #   → broadcast over the case's K rows, as FiLMBlock does with (γ, β). // case_group이면 케이스 행을 K행에 브로드캐스트
+        g = torch.exp(m * torch.log(self.fourier.freqs / self.fourier_f_ref))   # (n, L)
+        g = torch.cat([g, g], dim=-1)                                           # (n, 2L) — [sin, cos] order
+        if g.shape[0] != emb_t.shape[0]:
+            n, d = g.shape
+            return (emb_t.view(n, -1, d) * g.unsqueeze(1)).view(-1, d)
+        return emb_t * g
 
     def CaseCond(self, feats, n_q):
         # CondOf for forward: one row per case when group_cond is on and the rows are case-major groups of n_q,
@@ -468,9 +502,11 @@ class Networks(nn.Module):
         # at each xattn block input (rows are then all tokens, n_q = 0). // 공통 트렁크 경로
         tau = feats[:, 0:1] # relative time within window // 윈도우 내 상대시간
         emb_t = self.fourier(tau)  # (N, 2L)
+        if self.fourier_gate is not None:                  # 케이스별 진폭 (f_k/f_ref)^m — t_norm·hard_ic는 raw τ
+            emb_t = self.GateFourier(emb_t, cond[2])
         t_norm = 2.0 * tau / self.march_dt - 1.0
         x = torch.cat([emb_t, t_norm], dim=-1)             # (N, 2L+1) — trunk는 τ만
-        gamma, beta = cond                                 # 케이스 → 블록별 (γ, β)
+        gamma, beta = cond[:2]                             # 케이스 → 블록별 (γ, β)
         # unbind once: backward is a single stack. Indexing gamma[:, i] per block instead gave
         # n_blocks SelectBackward nodes, each materializing a fresh (N, n_blocks, width) zero
         # tensor to scatter into — ~7% of the step (profile 2026-08-31).

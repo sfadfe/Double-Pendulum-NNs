@@ -26,6 +26,60 @@ class FourierFeatures(nn.Module):
         return torch.cat([torch.sin(proj), torch.cos(proj)], dim=-1)
 
 
+class TimeWarp(nn.Module):
+    # Per-case monotone time warp σ(τ; c) in front of the Fourier features (2026-10-19, branch time-warp, config.py warp_k)
+    #   s = τ/T, T = march_dt. σ/T = w_K ∘ … ∘ w_1(s), each w_i one speed dip with w(0) = 0 and w(1) = 1:
+    #     w(s) = S(s)/S(1),  S(s) = s − d·(tanh(β(s−μ)) + tanh(βμ))/β,  w'(s) = (1 − d·sech²(β(s−μ)))/S(1) > 0.
+    #   d = (1−ε)·tanh(u_d): d > 0 slows the clock around μ (dwell near the separatrix), d < 0 speeds it up.
+    #   μ = μ_lo + (μ_hi − μ_lo)·sigmoid(u_μ) (dip centre in window units, may lie outside [0, 1]),
+    #   β = β_lo + (β_hi − β_lo)·sigmoid(u_β) (dip sharpness, width ≈ 1/β). u = MLP(cond) — τ-independent, so the
+    #   (d, μ, β) stack rides on the cond tuple (CondOf) and enters the τ-jvp as a zero-tangent primal.
+    #   Output layer zero-init with the β bias at β_init → d = 0 → σ = τ exactly at init (and for every case until
+    #   the d rows move). σ(0) = 0, σ(T) = T: the trunk keeps its input range, the warp only redistributes time.
+    #   μ of w_1 is in real window time (w_1 acts on s) — TrainCfg.warp_sup supervises it.
+    # // 케이스별 단조 시간 워프. 감속 딥 K개의 합성, 끝점 고정. zero-init → 시작 시 σ = τ
+    EPS = 0.05
+    MU_LO, MU_HI = -0.5, 1.5
+    BETA_LO, BETA_HI = 1.0, 40.0
+
+    def __init__(self, cond_dim, hidden, k, beta_init=4.0):
+        super().__init__()
+        self.k = k
+        self.net = nn.Sequential(nn.Linear(cond_dim, hidden), nn.SiLU(), nn.Linear(hidden, 3 * k))
+        r = (beta_init - self.BETA_LO) / (self.BETA_HI - self.BETA_LO)
+        self.beta_bias = float(torch.logit(torch.tensor(r)))
+
+    def ResetOut(self):
+        # after the Kaiming loop (Networks.ResetParameters) // Kaiming 뒤 출력층 초기화
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        with torch.no_grad():
+            self.net[-1].bias[2 * self.k:].fill_(self.beta_bias)
+
+    def forward(self, c):
+        # c (n, cond_dim) → (n, 3, K) = [d; μ; β] // 워프 파라미터 스택
+        u = self.net(c).view(-1, 3, self.k)
+        d = (1.0 - self.EPS) * torch.tanh(u[:, 0])
+        mu = self.MU_LO + (self.MU_HI - self.MU_LO) * torch.sigmoid(u[:, 1])
+        beta = self.BETA_LO + (self.BETA_HI - self.BETA_LO) * torch.sigmoid(u[:, 2])
+        return torch.stack([d, mu, beta], dim=1)
+
+    @staticmethod
+    def Sigma(tau, wp, march_dt):
+        # tau (N, 1), wp (n, 3, K) with N = n·R (case-major, R rows per case; R = 1 for per-row cond) → σ (N, 1)
+        # // case_group이면 케이스 행 wp를 R행에 브로드캐스트
+        # σ = τ + T·(w(s) − s): exactly τ when every d = 0 ((τ/T)·T is off by an ulp) // d = 0이면 비트 단위로 σ = τ
+        n = wp.shape[0]
+        s0 = (tau / march_dt).view(n, -1)                                    # (n, R)
+        s = s0
+        for i in range(wp.shape[-1]):
+            d, mu, beta = wp[:, 0, i:i + 1], wp[:, 1, i:i + 1], wp[:, 2, i:i + 1]   # (n, 1)
+            t0 = torch.tanh(beta * mu)
+            s_end = 1.0 - d * (torch.tanh(beta * (1.0 - mu)) + t0) / beta
+            s = (s - d * (torch.tanh(beta * (s - mu)) + t0) / beta) / s_end
+        return tau + ((s - s0) * march_dt).view(-1, 1)
+
+
 class ParamEmbed(nn.Module):
     # params_norm(4) → dim → dim, SiLU // option B3
     def __init__(self, dim):
@@ -279,6 +333,14 @@ class Networks(nn.Module):
         self.win_enc = None
         if self.win_tok > 0:
             self.win_enc = nn.Sequential(nn.Linear(4 * self.win_tok, width), nn.SiLU(), nn.Linear(width, width))
+        # Time warp σ(τ; c) (config.py warp_k): its (d, μ, β) stack rides on the cond tuple as (γ, β, wp) and _Core
+        #   feeds σ instead of τ to the Fourier features and t_norm (hard_ic keeps raw τ). Built last, so the init
+        #   draws of every module above are unchanged. // 시간 워프. 마지막에 생성 → 위 모듈들의 초기화 난수 불변
+        self.time_warp = None
+        if netCfg.warp_k > 0:
+            if self.n_tok > 0:
+                raise ValueError("warp_k: plain nets only (no xattn / window tokens)")
+            self.time_warp = TimeWarp(netCfg.cond_dim, netCfg.warp_hidden, netCfg.warp_k, netCfg.warp_beta_init)
 
         self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
         self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)
@@ -337,6 +399,10 @@ class Networks(nn.Module):
                 continue
             nn.init.zeros_(film.net[-1].weight)
             nn.init.zeros_(film.net[-1].bias)
+
+        # Time-warp output zero-init (β bias at β_init) → d = 0, σ = τ (after the Kaiming loop) // 항등 워프에서 출발
+        if self.time_warp is not None:
+            self.time_warp.ResetOut()
 
     def SetHalf(self, mode):
         # fp16 GEMMs (TrainCfg.half_gemm): "off" | "blk" (block branch fc1) | "blk+film" (+ FiLM last layer)
@@ -427,12 +493,20 @@ class Networks(nn.Module):
         # (feats[:, 1:] only), so callers that evaluate many τ per case (rollout) or differentiate
         # in τ (jvp) compute it once and pass it to forward(cond=).
         # // FiLM 조건을 케이스 단위로 1회 계산해 forward(cond=)에 넘기기 위한 진입점
+        # warp_k > 0: (γ, β, wp) with wp (N, 3, K) — callers must treat cond as a tuple, not unpack two.
+        # // 워프가 켜지면 (γ, β, wp) 3원소 — 호출부는 2개 언패킹 금지, 튜플째로 넘긴다
         c = feats[:, 1:]
         if self.film_corr is None:
-            return self.film(c)
+            return self.film(c) + self.WarpOf(c)
         ga, ba = self.film(c)                          # 예측 구간 슬롯
         gc, bc = self.film_corr(c)                     # 보정 구간 슬롯 (film_split_at 이후)
-        return torch.cat([ga, gc], dim=1), torch.cat([ba, bc], dim=1)
+        return torch.cat([ga, gc], dim=1), torch.cat([ba, bc], dim=1), *self.WarpOf(c)
+
+    def WarpOf(self, c):
+        # () or (wp,), wp (N, 3, K) = [d; μ; β] of the time warp // 워프 파라미터, 워프 없으면 빈 튜플
+        if self.time_warp is None:
+            return ()
+        return (self.time_warp(c),)
 
     def CaseCond(self, feats, n_q):
         # CondOf for forward: one row per case when group_cond is on and the rows are case-major groups of n_q,
@@ -467,10 +541,12 @@ class Networks(nn.Module):
         # n_q + P rows per case) or from tok_hs (n_q rows per case). record → also return the token streams
         # at each xattn block input (rows are then all tokens, n_q = 0). // 공통 트렁크 경로
         tau = feats[:, 0:1] # relative time within window // 윈도우 내 상대시간
-        emb_t = self.fourier(tau)  # (N, 2L)
-        t_norm = 2.0 * tau / self.march_dt - 1.0
+        # time warp: the trunk reads σ(τ; c), hard_ic keeps raw τ (c1 identities hold for any σ) // 트렁크만 σ
+        sig = tau if self.time_warp is None else TimeWarp.Sigma(tau, cond[2], self.march_dt)
+        emb_t = self.fourier(sig)  # (N, 2L)
+        t_norm = 2.0 * sig / self.march_dt - 1.0
         x = torch.cat([emb_t, t_norm], dim=-1)             # (N, 2L+1) — trunk는 τ만
-        gamma, beta = cond                                 # 케이스 → 블록별 (γ, β)
+        gamma, beta = cond[:2]                             # 케이스 → 블록별 (γ, β)
         # unbind once: backward is a single stack. Indexing gamma[:, i] per block instead gave
         # n_blocks SelectBackward nodes, each materializing a fresh (N, n_blocks, width) zero
         # tensor to scatter into — ~7% of the step (profile 2026-08-31).

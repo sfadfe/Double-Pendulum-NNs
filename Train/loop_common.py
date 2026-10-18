@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 import sys
 import time
@@ -26,6 +27,8 @@ CSV_HEADER = [
     # goal 1 판정 지표 — 평균이 1e-3이어도 seam에서 튀면 목표 미달이므로
     # 집계가 아니라 **per-τ 최대**로 판정한다. RollTauMax는 running min이 아닌 per-epoch 값.
     "RollTauMax", "RollTauArgmax", "RollSeamJump", "RollTauMaxBest",
+    # time warp (NetCfg.warp_k): MSE of μ_1 vs its label (warp_sup_label) over labeled windows, window units // 워프 첫 딥 중심 오차
+    "AvgLoss_Warp",
 ]
 
 
@@ -40,6 +43,8 @@ def InitCkptDir(suffix=""):
 
 def SetupCaseSplit(trainer, t_params):
     # Held-out val + train pool // 앞 n_val은 검증, 나머지 학습 풀
+    if trainer.dataCfg.split_meta:
+        return SetupMetaSplit(trainer, t_params)
     max_cases = t_params["max_cases"]
     n_val = min(t_params.get("n_val", 2000), trainer.n_case - max_cases)
     trainer.max_cases = max_cases
@@ -54,6 +59,33 @@ def SetupCaseSplit(trainer, t_params):
         print(f"[case_bin] {t_params.get('case_bin', 0)}/{n_bins}  log(e_rel/e_flip) in [{lo:.3f}, {hi:.3f}]  "
               f"val {len(trainer.val_cases)}  train {len(trainer.train_pool)}")
     trainer.active_cases = trainer.train_pool[:max_cases]
+
+
+def SetupMetaSplit(trainer, t_params):
+    # Split + is_flip from a corpus meta (DataCfg.split_meta, state/build_joint.py) // meta의 val/train 분할 + flip 라벨
+    #   flip_repeat k > 1: the flip train cases appear k times in train_pool → k× their share of data / colloc / roll
+    #   draws. max_cases is clamped to the pool size. // flip 학습 케이스를 풀에 k번 넣어 추첨 비율 k배
+    path = Path(trainer.dataCfg.split_meta)
+    if not path.is_absolute():
+        path = Path(__file__).parent.parent / path
+    with open(path, encoding="utf-8") as f:
+        meta = json.load(f)
+    dev = trainer.device
+    is_flip = torch.tensor(meta["is_flip"], dtype=torch.bool, device=dev)
+    if is_flip.shape[0] != trainer.n_case:
+        raise ValueError(f"split_meta is_flip len {is_flip.shape[0]} != n_case {trainer.n_case}")
+    trainer.is_flip = is_flip
+    trainer.val_cases = torch.tensor(meta["val_idx"], dtype=torch.long, device=dev)
+    train = torch.tensor(meta["train_idx"], dtype=torch.long, device=dev)
+    k = int(t_params.get("flip_repeat", 1))
+    if k > 1:
+        train = torch.cat([train] + [train[is_flip[train]]] * (k - 1))
+    trainer.train_pool = train
+    trainer.max_cases = min(int(t_params["max_cases"]), len(train))
+    trainer.active_cases = trainer.train_pool[:trainer.max_cases]
+    n_tf = int(is_flip[train].sum())
+    print(f"[split] {path.name}: val {len(trainer.val_cases)} (flip {int(is_flip[trainer.val_cases].sum())})  "
+          f"train pool {len(train)} (flip rows {n_tf}, flip_repeat {k})  max_cases {trainer.max_cases}")
 
 
 def CaseBinMask(trainer, n_bins, k):
@@ -610,7 +642,7 @@ def RunTrainLoop(
     try:
         for epoch in pbar:
             epoch_sums = {k: torch.tensor(0.0, device=device)
-                          for k in ["data", "kin", "phys", "energy", "ic", "roll"]}
+                          for k in ["data", "kin", "phys", "energy", "ic", "roll", "warp"]}
             epoch_steps = 0
             metric_f = float("inf")
             phase1 = epoch < DATA_WARMUP_EPOCHS
@@ -672,6 +704,7 @@ def RunTrainLoop(
             #   energy는 E만 제약) → θ 헤드 미분이 발산. 측정: corr(ω,dθ/dτ) 0.995 → 0.120,
             #   RMS(dθ/dτ) 16.4 vs RMS(ω) 1.88 (2026_07_24 런). // 항상 False
             trainer._kin_detach = False
+            trainer._warp_sup_w = trainer.WarpSupAt(epoch)   # μ_1 supervision weight // μ_1 감독 가중치 (warp_sup 스케줄)
 
             # 직전 rebalance의 효과가 _term_gnorm EMA(0.9/0.1)에 완전히 반영되는 시점은
             # 에폭 1회분 스텝 뒤다(0.9^100 ≈ 2.6e-5). 그래서 스냅샷은 rebalance한 에폭이 아니라
@@ -796,6 +829,8 @@ def RunTrainLoop(
                 avg["phys"] = avg["energy"] = float("nan")
             if not roll_on:
                 avg["roll"] = float("nan")
+            if not trainer.WarpSupOn():
+                avg["warp"] = float("nan")
 
             # B3: 평가·best.pt는 EMA 가중치로 — raw는 백업 후 이 구간 동안만 스왑
             do_val = epoch % t_params["val_interval"] == 0
@@ -930,6 +965,7 @@ def RunTrainLoop(
                 "RollTauArgmax":     tau_argmax,
                 "RollSeamJump":      seam_jump,
                 "RollTauMaxBest":    tau_max_best,
+                "AvgLoss_Warp":      avg["warp"],
             })
             WriteLog(log_path, log_rows)
             param_log.Record(epoch, step, lr)   # raw 가중치 기준 (RestoreRaw 이후)

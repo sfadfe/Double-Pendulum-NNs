@@ -79,6 +79,16 @@ class NetCfg:
     # // block_acts: 블록별 가지 활성함수 (ztanh = 짝함수). stream_act_at: 그 블록 뒤에서 스트림 전체에 SiLU 1회 (skip 없음)
     block_acts: tuple = ()
     stream_act_at: tuple = ()
+    # Per-case time warp (2026-10-19, branch time-warp, networks.TimeWarp). warp_k > 0: the trunk reads σ(τ; c) instead
+    #   of τ (Fourier features and t_norm; hard_ic keeps raw τ). σ = composition of warp_k speed dips with σ(0) = 0,
+    #   σ(march_dt) = march_dt, (depth d, centre μ, sharpness β) per case from an MLP(cond) of width warp_hidden,
+    #   β starts at warp_beta_init (window units). Output zero-init → d = 0 → σ = τ at init. Near the separatrix
+    #   (θ2 ≈ π) the dwell time is exponentially sensitive to the energy, so cases share a shape but not a clock;
+    #   the FiLM trunk after a fixed RFF cannot move the time axis. 0 = off, state_dict unchanged. Plain nets only.
+    # // 케이스별 시간 워프: 트렁크 입력 τ → σ(τ; c). 감속 딥 warp_k개, 끝점 고정, zero-init → 시작 시 σ = τ. 0 = 끔
+    warp_k: int = 0
+    warp_hidden: int = 64
+    warp_beta_init: float = 4.0
 
     @property
     def gx_dim(self) -> int:
@@ -184,6 +194,24 @@ class TrainCfg:
     #   Must divide n_colloc, colloc_chunk and batch_size. // 케이스당 K행으로 묶어 FiLM을 케이스당 1회 계산
     case_group: int = 1
 
+    # Supervision of the first warp dip centre μ_1 (NetCfg.warp_k > 0, Trainstep.WarpSupDraw / WarpSupLoss). Each step
+    #   draws warp_sup_cases (case, window start) pairs from active_cases on the corpus grid and labels them over the
+    #   window extended by march_dt/2 on both sides (μ's range). warp_sup_label "cross": s* = the over-the-top
+    #   crossing (θ = π + 2πk, either arm) nearest the window centre, windows without one unlabeled (nonflip never
+    #   labeled). "ke": s* = interior minimum of the true kinetic energy, kept where min/max KE < warp_sup_ratio.
+    #   Loss = mean (μ_1 − s*)² over labeled windows, gradient into the warp MLP only (detached feats), own clip
+    #   budget, outside RebalanceGradScales. Weight warp_sup until epoch warp_sup_hold, then linear to 0 at
+    #   warp_sup_end (≤ hold → step). Without it the dip has no gradient to its centre while d = 0 and the trunk can
+    #   absorb the misalignment first (the MoE chicken-and-egg). warp_sup = 0 → off; with warp_k > 0 and
+    #   warp_sup_cases > 0 the same loss is still logged (no_grad) as AvgLoss_Warp = μ_1 vs label.
+    # // 첫 딥 중심 μ_1 감독: 라벨 "cross" = 꼭대기 통과 시각, "ke" = 운동에너지 내부 극소. 워프 MLP에만 gradient, 밸런싱 밖
+    warp_sup: float = 0.0
+    warp_sup_hold: int = 0
+    warp_sup_end: int = 0
+    warp_sup_cases: int = 4096
+    warp_sup_ratio: float = 0.25
+    warp_sup_label: str = "cross"
+
 @dataclass
 class CollocCfg:
     n_colloc: int = 20000
@@ -253,6 +281,11 @@ class DataCfg:
     label_dt_phase2: float = 0.0
     label_dense_frac: float = 0.0
     slide_frac: float = 0.0
+    # Corpus meta with is_flip / val_idx / train_idx (state/build_joint.py). Set → loop_common.SetupCaseSplit takes the
+    #   split from it instead of "first n_val cases", and is_flip enables the flip / nonflip split of val and rollout.
+    #   [train] flip_repeat k > 1 lists the flip train cases k times in the train pool. "" = off.
+    # // 코퍼스 meta로 val/train 분할 + is_flip (pretrain 경로에서 flip 혼합 학습). "" = 종전 (앞 n_val)
+    split_meta: str = ""
 
 
 def LoadConfig(path):
@@ -284,6 +317,8 @@ def LoadConfig(path):
         xattn_tokens=n.get("xattn_tokens", 8), xattn_heads=n.get("xattn_heads", 4),
         win_tokens=n.get("win_tokens", 0),
         block_acts=tuple(n.get("block_acts", [])), stream_act_at=tuple(n.get("stream_act_at", [])),
+        warp_k=n.get("warp_k", 0), warp_hidden=n.get("warp_hidden", 64),
+        warp_beta_init=n.get("warp_beta_init", 4.0),
     )
 
     train_cfg = TrainCfg(
@@ -319,6 +354,9 @@ def LoadConfig(path):
         matmul_precision=t.get("matmul_precision", "high"),
         half_gemm=t.get("half_gemm", "off"),
         case_group=t.get("case_group", 1),
+        warp_sup=t.get("warp_sup", 0.0), warp_sup_hold=t.get("warp_sup_hold", 0),
+        warp_sup_end=t.get("warp_sup_end", 0), warp_sup_cases=t.get("warp_sup_cases", 4096),
+        warp_sup_ratio=t.get("warp_sup_ratio", 0.25), warp_sup_label=t.get("warp_sup_label", "cross"),
     )
 
     colloc_cfg = CollocCfg(
@@ -349,6 +387,7 @@ def LoadConfig(path):
         label_path=d.get("label_path", ""), label_score_path=d.get("label_score_path", ""),
         label_dt=d.get("label_dt", 0.0), label_dt_phase2=d.get("label_dt_phase2", 0.0),
         label_dense_frac=d.get("label_dense_frac", 0.0), slide_frac=d.get("slide_frac", 0.0),
+        split_meta=d.get("split_meta", ""),
     )
 
     # 단위 주의: rel_tol_*은 에폭당 개선율 하한, patience_*는 에폭 수.

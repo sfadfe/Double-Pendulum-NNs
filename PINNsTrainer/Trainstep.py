@@ -19,6 +19,7 @@ class LambdaBalance:
         self._colloc_ic_sigma = 0.0        # 물리 콜로케이션 IC 섭동 폭 (Phase 3, 매 에폭 램프) // off-manifold
         self._colloc_mode = "grid"         # collocation mode of the epoch (CollocCfg.sched_modes) // loop에서 갱신
         self._phase1 = True                # phase-1 mirror — DataBatchSize / LabelBatch stride // loop에서 갱신
+        self._warp_sup_w = 0.0             # μ_1 supervision weight of the epoch (WarpSupAt) // loop에서 갱신
         self._bw_scale = {}                # 항별 backward 손실 스케일 (half_gemm) // _BwScale
         self._bw_first = self.BW_FIRST     # 노름을 모르는 항의 첫 스텝 스케일 // BackoffBwScales가 함께 낮춘다
         # 고정 base 가중치 — 동적 조정은 grad_scale(RebalanceGradScales) 단독 담당.
@@ -318,6 +319,7 @@ class LambdaBalance:
         losses["data"] = l_data.detach()
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
+        self._WarpSupTerm(acc, budget, losses)
 
         if colloc_meta is not None and self.kin_ramp > 0.0:
             self._BackwardKinChunks(colloc_meta, metric_box, losses)
@@ -335,6 +337,109 @@ class LambdaBalance:
     def _ZeroLoss(self):
         return torch.zeros((), device=self.device)
 
+    # --- time-warp dip-centre supervision (TrainCfg.warp_sup) // 워프 첫 딥 중심 μ_1 감독 ---
+    def WarpSupOn(self):
+        # loss computed (and logged) every step: warp present and a draw size set // 워프가 있으면 매 스텝 계산·기록
+        return self.time_warp is not None and self.trainCfg.warp_sup_cases > 0
+
+    def WarpSupAt(self, epoch):
+        # warp_sup until warp_sup_hold, linear to 0 at warp_sup_end, 0 after // 유지 → 선형 감쇠 → 해제
+        c = self.trainCfg
+        if c.warp_sup <= 0.0 or epoch >= max(c.warp_sup_end, c.warp_sup_hold):
+            return 0.0
+        if epoch < c.warp_sup_hold:
+            return c.warp_sup
+        return c.warp_sup * (c.warp_sup_end - epoch) / (c.warp_sup_end - c.warp_sup_hold)
+
+    def WarpSupDraw(self, n):
+        # n random (case, window start) pairs of active_cases on the corpus grid, the window extended by T/2 on both
+        #   sides (= μ's range [−0.5, 1.5]) → (cond (n, F−1) without grad, s* (n,), keep (n,) float) via WarpLabels.
+        # // 창 시작 n개 추첨 → 창 ±T/2 구간 라벨
+        dev = self.device
+        m = int(round(self.dataCfg.march_dt / self.dt))
+        e = m // 2
+        data, _ = self._ActiveSource()
+        ac = self.active_cases
+        cases = ac[torch.randint(0, len(ac), (n,), device=dev)]
+        i0 = torch.randint(e, self.n_step - m - e, (n,), device=dev)           # window start; span stays in the data
+        grid = (i0 - e).unsqueeze(1) + torch.arange(m + 2 * e + 1, device=dev) # (n, span+1)
+        if data.device != dev:
+            seg = data[cases.cpu().unsqueeze(1), grid.cpu()].to(dev)
+        else:
+            seg = data[cases.unsqueeze(1), grid]                                # (n, span+1, 13) [t, θ1, ω1, θ2, ω2, ...]
+        params = self._ParamsAt(cases)
+        s_star, keep = self.WarpLabels(seg, params)
+        with torch.no_grad():
+            feats = self._BuildFeats(torch.zeros(n, 1, device=dev), params, seg[:, e, 1:5])
+        return feats[:, 1:], s_star, keep
+
+    def WarpLabels(self, seg, params):
+        # seg (n, span+1, 13) corpus rows from window start − T/2 to window end + T/2 (span = m + 2·(m//2), m = T/dt),
+        #   params (n, 4) → s* (n,) in window units, keep (n,) float. Also used by Train/window_scale_probe.py.
+        #   warp_sup_label "cross": s* = the over-the-top crossing (θ = π + 2πk, either arm, stored θ unwrapped)
+        #     nearest the window centre, linear sub-grid interpolation; keep = a crossing in the span. Flip errors sit
+        #     at these crossings (vault FlipAdapter §4), while the kinetic-energy / per-arm |ω| minima lie a median
+        #     0.08–0.17 s away from them (joint corpus, 2000 flip cases, 2026-10-19).
+        #   "ke": s* = interior minimum of the true kinetic energy, parabolic refinement; keep = interior and
+        #     min/max KE < warp_sup_ratio. Labels nonflip turning points too; covers 17 % of the flip crossing windows.
+        # // 라벨: "cross" = 꼭대기 통과 시각 (flip 오차가 몰린 곳), "ke" = 운동에너지 내부 극소
+        dev = seg.device
+        m = int(round(self.dataCfg.march_dt / self.dt))
+        e = m // 2
+        span = m + 2 * e
+        n = seg.shape[0]
+        if self.trainCfg.warp_sup_label == "cross":
+            th = seg[:, :, 1::2][:, :, :2]                                      # (n, span+1, 2) θ1, θ2
+            kk = torch.floor((th - math.pi) / (2.0 * math.pi))
+            cr = kk[:, 1:] != kk[:, :-1]                                        # (n, span, 2) crossing in step i → i+1
+            b = math.pi + 2.0 * math.pi * torch.maximum(kk[:, 1:], kk[:, :-1])  # the boundary between the two
+            dth = th[:, 1:] - th[:, :-1]
+            frac = ((b - th[:, :-1]) / torch.where(dth == 0, torch.ones_like(dth), dth)).clamp(0.0, 1.0)
+            pos = torch.arange(span, device=dev).view(1, -1, 1) + frac          # crossing position in grid steps
+            dist = torch.where(cr, (pos - (e + 0.5 * m)).abs(), torch.full_like(pos, float("inf")))
+            best = dist.view(n, -1).argmin(dim=1)
+            s_star = (pos.view(n, -1).gather(1, best.unsqueeze(1)).squeeze(1) - e) / m
+            keep = cr.view(n, -1).any(dim=1).float()
+        else:
+            m1, m2, L1, L2 = (params[:, i:i + 1] for i in range(4))
+            th1, w1, th2, w2 = seg[:, :, 1], seg[:, :, 2], seg[:, :, 3], seg[:, :, 4]
+            v1_sq = (L1 * w1) ** 2
+            ke = 0.5 * m1 * v1_sq + 0.5 * m2 * (v1_sq + (L2 * w2) ** 2 + 2.0 * L1 * L2 * w1 * w2 * torch.cos(th1 - th2))
+            k = ke.argmin(dim=1)
+            kc = k.clamp(1, span - 1)
+            lo = ke.gather(1, (kc - 1).unsqueeze(1)).squeeze(1)
+            mid = ke.gather(1, kc.unsqueeze(1)).squeeze(1)
+            hi = ke.gather(1, (kc + 1).unsqueeze(1)).squeeze(1)
+            curv = lo - 2.0 * mid + hi
+            delta = torch.where(curv > 0, 0.5 * (lo - hi) / curv.clamp_min(1e-12), torch.zeros_like(curv)).clamp(-0.5, 0.5)
+            s_star = (kc.float() + delta - e) / m
+            keep = (((k > 0) & (k < span))
+                    & (ke.min(dim=1).values < self.trainCfg.warp_sup_ratio * ke.max(dim=1).values)).float()
+        return s_star, keep
+
+    def WarpSupLoss(self, n):
+        # mean (μ_1 − s*)² over the kept windows of WarpSupDraw; cond has no grad → only the warp MLP learns
+        # // μ_1을 s*에 맞춘다. 워프 MLP에만 gradient
+        cond, s_star, keep = self.WarpSupDraw(n)
+        mu1 = self.time_warp(cond)[:, 1, 0]
+        return (keep * (mu1 - s_star) ** 2).sum() / keep.sum().clamp_min(1.0)
+
+    def _WarpSupTerm(self, acc, budget, losses):
+        # Backward + flush of the μ_1 term when its weight is > 0, else the no_grad value for the log. Unnamed flush:
+        #   no _term_gnorm slot (GnormDrift would read the scheduled decay as drift), backward scale 1 (fp32 MLP).
+        # // 가중치 > 0이면 backward·flush, 아니면 no_grad로 값만 기록
+        if not self.WarpSupOn():
+            return
+        w = self._warp_sup_w
+        if w > 0.0:
+            l_w = self.WarpSupLoss(self.trainCfg.warp_sup_cases)
+            self._Backward(w * l_w, None)
+            self._FlushTerm(acc, budget, None)
+        else:
+            with torch.no_grad():
+                l_w = self.WarpSupLoss(self.trainCfg.warp_sup_cases)
+        losses["warp"] = l_w.detach()
+
     def BackwardAll(self, batch, colloc_meta, ic_parts, roll_loss=None):
         # Peak VRAM: data → physics chunks → IC chunks → roll // 항목별 순차 backward
         # 반환값(metric, losses)은 0-dim GPU 텐서 — 호출자가 스텝 끝에서 1회만 float()로 읽는다.
@@ -351,6 +456,7 @@ class LambdaBalance:
         losses["data"] = l_data.detach()
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
+        self._WarpSupTerm(acc, budget, losses)
 
         self._BackwardPhysicsChunks(colloc_meta, metric_box, losses)
         self._FlushTerm(acc, budget, "phys")   # kin+phys+energy combo 단위 // combo is what blows up

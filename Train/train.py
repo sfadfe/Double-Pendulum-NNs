@@ -31,7 +31,8 @@ def Train(MainFolderPath, cfg_path=None):
     # Fixed seed for fresh pretrain: every RNG in the pipeline is torch (init, batch draws,
     #   colloc, roll k0/depth), and manual_seed covers CUDA too.
     # // 시드 고정 — 런 간 차이를 시드가 아닌 설정 효과로 읽기 위함 (SetupFinetune의 42와 동일)
-    torch.manual_seed(42)
+    # [train] seed (default 42) for seed repeats of an arm // 시드 반복용, 기본 42 = 종전
+    torch.manual_seed(int(t_params.get("seed", 42)))
 
     shutil.copy(cfg_path, MainFolderPath / "config.toml")
 

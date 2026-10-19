@@ -257,8 +257,6 @@ class Loss:
             keep = torch.isfinite(state).all(1) & (state[:, 1::2].abs().amax(1) <= cap)
             st_true = data[ci, i_start_c.to(ci.device)][:, [1, 2, 3, 4]].to(dev)
             state = torch.where(keep.unsqueeze(1), state, st_true)
-            n_dead = torch.stack([(~keep).sum().float(), torch.full((), float(keep.numel()), device=dev)])
-            self.__dict__["_roll_dead"] = self.__dict__.get("_roll_dead", 0.0) + n_dead   # [excluded, total] per epoch
         n_seg = int(round(md / dt))                                # 윈도우 격자 길이 — 전 케이스 동일
         off = torch.arange(1, n_seg + 1, device=dev)               # exclude τ=0, include end
         if off.numel() > n_points:
@@ -276,6 +274,13 @@ class Loss:
         omega_pred = out[:, :, 2:]
         if self.trainCfg.roll_target == "rk4":
             ref = self._RollRk4Target(state, params, off, (n_seg, n_points))
+            if keep is not None:
+                # trap 34: RK4 at roll_rk4_dt 0.005 is step-size unstable at some kept ICs (|ω| 72, m2/m1 5: nan in fp32
+                #   and fp64, finite at h 0.0025); drop the case, zero its ref so pred − ref stays finite (0 × inf in
+                #   backward is NaN). // 통과 IC에서도 RK4 h 0.005가 발산 → 제외, ref 0
+                fin = torch.isfinite(ref).all(2).all(1)
+                keep = keep & fin
+                ref = torch.where(fin.view(-1, 1, 1), ref, torch.zeros((), device=dev))
             theta_true, omega_true = ref[:, :, [0, 2]], ref[:, :, [1, 3]]
         else:
             grid_idx = grid.cpu() if data.device != self.device else grid
@@ -284,6 +289,9 @@ class Loss:
                 seg = seg.to(self.device)
             theta_true = seg[:, :, [1, 3]]
             omega_true = seg[:, :, [2, 4]]
+        if keep is not None:
+            n_dead = torch.stack([(~keep).sum().float(), torch.full((), float(keep.numel()), device=dev)])
+            self.__dict__["_roll_dead"] = self.__dict__.get("_roll_dead", 0.0) + n_dead   # [excluded, total] per epoch
         return ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
             (omega_pred - omega_true) ** 2
         ).mean(dim=(1, 2)), keep

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 """
 - 입력 feats (N, feat_dim): [τ, sinθ1, cosθ1, sinθ2, cosθ2, ω1, ω2, param_embed(32)]
   ParamEmbed는 Dataset._BuildFeats에서 호출 — raw m/L 대신 임베딩 벡터 사용 // option B
+  hard_ic "local": + 4·local_k 바탕 해 계수 열 (Dataset.LocalBase, trap 33) — FiLM은 cond_dim 열만 읽는다
 - time-marching flow map: τ는 윈도우 내 상대시간(τ∈[0, march_dt]), trig/ω는 윈도우 시작 상태(IC)
 - τ는 Fourier Features(물리 주파수, Hz)로 매핑되고, 또한 [0, march_dt]에서 [-1, 1]로 정규화됨
 - 출력: (N, 4) = [Δθ1, Δθ2, ω1, ω2]. Δθ = θ(τ) − θ_IC (상대각), ω는 절대값.
@@ -244,7 +245,9 @@ class Networks(nn.Module):
     def __init__(self, netCfg, dataCfg):
         super().__init__()
         self.march_dt = dataCfg.march_dt   # 상대시간 정규화 기준 // window duration for τ normalization
-        self.hard_ic = netCfg.hard_ic      # "off" | "c0" | "c1" — τ=0 경계조건 부과 방식 (forward 말미)
+        self.hard_ic = netCfg.hard_ic      # "off" | "c0" | "c1" | "local" — τ=0 경계조건 부과 방식 (forward 말미)
+        self.local_k = netCfg.local_k      # "local": feats carry 4·local_k base columns after cond_dim // 바탕 계수 열
+        self.n_case_cols = netCfg.cond_dim # FiLM / warp input = feats[:, 1:1 + cond_dim] // 조건 열만
 
         self.fourier = FourierFeatures(netCfg.fourier_l, netCfg.f_min, netCfg.f_max)
         self.param_embed = ParamEmbed(netCfg.param_embed_dim)
@@ -495,7 +498,7 @@ class Networks(nn.Module):
         # // FiLM 조건을 케이스 단위로 1회 계산해 forward(cond=)에 넘기기 위한 진입점
         # warp_k > 0: (γ, β, wp) with wp (N, 3, K) — callers must treat cond as a tuple, not unpack two.
         # // 워프가 켜지면 (γ, β, wp) 3원소 — 호출부는 2개 언패킹 금지, 튜플째로 넘긴다
-        c = feats[:, 1:]
+        c = feats[:, 1:1 + self.n_case_cols]           # hard_ic "local" base columns excluded // 바탕 계수 열 제외
         if self.film_corr is None:
             return self.film(c) + self.WarpOf(c)
         ga, ba = self.film(c)                          # 예측 구간 슬롯
@@ -616,6 +619,17 @@ class Networks(nn.Module):
             # 상태(trap 16: corr(dθ/dτ, ω_true)=0.07)를 최소한 seam에서는 붙여 놓는다.
             # 헤드는 O(τ²) 보정만 담당 — τ→0 부근 오차가 s²로 눌린다.
             theta = s * (self.march_dt * w_ic + s * a_theta)
+        elif self.hard_ic == "local":
+            # c1 + gated window-start linearization base Σ_k g_k s^{k+1} (Dataset.LocalBase; g_0's θ part is 0, so
+            #   the c1 identities Δθ(0) = 0, ω(0) = ω_IC, dΔθ/dτ(0) = ω_IC hold). Heads keep c1's prefactors: where the
+            #   gate closes the remainder is c1's again. // c1 + 게이트 바탕 급수. 헤드는 c1 프리팩터 그대로 나머지 담당
+            g = feats[:, -4 * self.local_k:].view(-1, self.local_k, 4)
+            sk, base = s, 0.0
+            for k in range(self.local_k):
+                base = base + g[:, k] * sk                                    # (N, 4) [θ1, ω1, θ2, ω2]
+                sk = sk * s
+            theta = s * (self.march_dt * w_ic + s * a_theta) + base[:, 0::2]
+            omega = omega + base[:, 1::2]
         else:
             theta = s * a_theta                 # ref: Δθ(0) = 0 만
         return torch.cat([theta, omega], dim=-1)  # (N, 4) [Δθ1, Δθ2, ω1, ω2]

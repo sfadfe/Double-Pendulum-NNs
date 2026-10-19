@@ -22,9 +22,15 @@ class NetCfg:
     #   "off" — 종전. 출력이 raw [Δθ, ω]이고 IC는 soft 손실로만 유도된다.
     #   "c0"  — Δθ = s·A_θ, ω = ω_IC + s·A_ω. Δθ(0)=0, ω(0)=ω_IC 가 항등식.
     #   "c1"  — 추가로 dΔθ/dτ(0) = ω_IC. Δθ = s·(march_dt·ω_IC + s·A_θ).
+    #   "local" — c1 + base of the window-start linearization ẋ = f(x0) + J(x0)(x − x0), truncated series
+    #             Σ_{k<local_k} J^k f0 τ^{k+1}/(k+1)!, gated back to c1 by γ = 1/(1 + (ζ/local_z0)^4),
+    #             ζ = march_dt·(root scale of J's characteristic polynomial). Heads learn the remainder.
+    #             (2026-10-19, scratch/base_gate_probe.py) // 창 시작 상태 선형화 해를 바탕으로, 헤드는 나머지만
     #   "off"가 아니면 IC 손실이 정확히 0이므로 loop가 ic 항 자체를 끈다(비용 절감).
     #   구조 변경이라 체크포인트 비호환 — 값을 바꾸면 fresh pretrain이 필요하다.
     hard_ic: str = "c1"
+    local_k: int = 4          # hard_ic "local": series terms // 급수 항 수
+    local_z0: float = 2.0     # hard_ic "local": gate scale of ζ // 게이트 기준 ζ
 
     # 조건화: trunk 입력은 τ features뿐, 케이스(IC·param_embed)는 FiLMCond를
     #   타고 블록마다 (γ, β)로 잔차 가지를 곱셈 변조한다 (networks.FiLMBlock). 옵션 아님.
@@ -319,6 +325,7 @@ def LoadConfig(path):
         block_acts=tuple(n.get("block_acts", [])), stream_act_at=tuple(n.get("stream_act_at", [])),
         warp_k=n.get("warp_k", 0), warp_hidden=n.get("warp_hidden", 64),
         warp_beta_init=n.get("warp_beta_init", 4.0),
+        local_k=n.get("local_k", 4), local_z0=n.get("local_z0", 2.0),
     )
 
     train_cfg = TrainCfg(

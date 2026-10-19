@@ -371,7 +371,7 @@ class LambdaBalance:
         s_star, keep = self.WarpLabels(seg, params)
         with torch.no_grad():
             feats = self._BuildFeats(torch.zeros(n, 1, device=dev), params, seg[:, e, 1:5])
-        return feats[:, 1:], s_star, keep
+        return feats[:, 1:1 + self.n_case_cols], s_star, keep
 
     def WarpLabels(self, seg, params):
         # seg (n, span+1, 13) corpus rows from window start − T/2 to window end + T/2 (span = m + 2·(m//2), m = T/dt),
@@ -762,16 +762,17 @@ class TimeMarching:
             cond = tuple(c.repeat_interleave(n_points, dim=0) for c in cond)
         return self(feats, cond=cond, n_q=n_points).reshape(n, n_points, 4)
 
-    def _RollRound(self, state, p_emb, tau_col, rem):
+    def _RollRound(self, state, p_emb, params, tau_col, rem):
         # One pushforward round of _RolloutMergedDraws as one compiled graph: feats → window end → hand-off, and
         # cases with no rounds left (rem ≤ 0) stay frozen. p_emb (n,E) / tau_col (n,1) are case-constant, built once per step.
         # Eager feats + compiled forward + eager hand-off was 0.39 ms per round, launch-bound (64 and 256 cases take
         # the same time); fused 0.18 ms, same bits (film 256×6, R9700, 2026-10-15).
         # // 라운드 하나를 compile 1개로 — 수학 동일, 런치 수만 줄인다. state (n,4) [θ1,ω1,θ2,ω2], rem (n,1) 남은 라운드
-        return self._Compiled("roll_round", self._RollRoundImpl)(state, p_emb, tau_col, rem)
+        # params (n,4) raw m, L — hard_ic "local" builds its base from them // 바탕 해 계수용 raw 파라미터
+        return self._Compiled("roll_round", self._RollRoundImpl)(state, p_emb, params, tau_col, rem)
 
-    def _RollRoundImpl(self, state, p_emb, tau_col, rem):
-        last = self._RollForwardImpl(self._FeatsOf(tau_col, state, p_emb), 1)[:, -1, :]   # (n,4) [Δθ,ω]
+    def _RollRoundImpl(self, state, p_emb, params, tau_col, rem):
+        last = self._RollForwardImpl(self._FeatsOf(tau_col, state, p_emb, params), 1)[:, -1, :]   # (n,4) [Δθ,ω]
         th_abs = state[:, 0::2] + last[:, :2]                      # 절대각 복원 (θ 열 0, 2)
         nxt = torch.stack([th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1)
         return torch.where(rem > 0, nxt, state), rem - 1          # depth를 다 쓴 케이스는 고정

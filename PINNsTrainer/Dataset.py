@@ -102,16 +102,54 @@ class Dataset:
         # params_raw는 호출자가 활성 소스에서 직접 해석해 전달 // explicit params, no hidden _replay_active dep
         pn = self.NormParams(params_raw)
         p_emb = self.param_embed(pn)  # Networks.ParamEmbed // option B3
-        return self._FeatsOf(tau, ic_state, p_emb)
+        return self._FeatsOf(tau, ic_state, p_emb, params_raw)
 
-    def _FeatsOf(self, tau, ic_state, p_emb):
+    def _FeatsOf(self, tau, ic_state, p_emb, params_raw):
         # _BuildFeats with the param embedding given — case-constant, so the roll pushforward computes it once per
         # step (Trainstep._RollRound). ω columns 1, 3 as the slice 1::2: an eager list index [1, 3] copies a CPU index
         # tensor to the GPU on every call (~47 µs, R9700 2026-10-15). Same values.
         # // param_embed를 받아 feats 조립. 리스트 인덱스 대신 같은 열의 slice (호출마다 H2D 복사 제거)
+        # hard_ic "local": the base coefficients ride as 4·local_k extra columns after p_emb (case-constant, not
+        #   read by FiLM — Networks.CondOf slices cond_dim). // 바탕 해 계수 열을 뒤에 붙인다
         trig = self.GetTrigs(ic_state)
         omega = ic_state[:, 1::2] / self.omega_rms
+        if self.hard_ic == "local":
+            return torch.cat([tau, trig, omega, p_emb, self.LocalBase(ic_state, params_raw).to(tau.dtype)], dim=1)
         return torch.cat([tau, trig, omega, p_emb], dim=1)
+
+    @torch.no_grad()
+    def LocalBase(self, ic_state, params_raw):
+        # hard_ic "local" base coefficients (N, 4·K): g_k = γ·J^k f0·T^{k+1}/(k+1)!, k < K, rows [θ1, ω1, θ2, ω2];
+        #   the θ part of g_0 (= ω0·T, the c1 term) is zeroed — Networks._HardIC keeps c1's own s·T·ω_IC.
+        #   J by central differences in fp64. γ = 1/(1 + (ζ/z0)^4), ζ = T·max_k |e_k|^{1/k}, e_k the elementary
+        #   symmetric functions of J's eigenvalues from the power sums tr(J^k) (Newton) — root scale of the
+        #   characteristic polynomial, a stand-in for ρ(J)·T without eig. No grad: inputs are data or detached
+        #   marched states. // 창 시작 상태 선형화 급수 계수 (게이트 포함). 학습 파라미터 없음
+        T, K = self.march_dt, self.netCfg.local_k
+        x, p = ic_state.double(), params_raw.double()
+        eps = 1e-6
+        d = eps * torch.eye(4, dtype=x.dtype, device=x.device)
+        xs = torch.cat([x[:, None] + d, x[:, None] - d], dim=1).reshape(-1, 4)     # (8N, 4) ±ε e_k
+        fs = self.ODE(xs, p.repeat_interleave(8, dim=0)).view(-1, 2, 4, 4)       # (N, ±, k, 4)
+        J = ((fs[:, 0] - fs[:, 1]) / (2.0 * eps)).transpose(1, 2)                 # J[:, i, k] = ∂f_i/∂x_k
+        Jp, pw = J, []
+        for _ in range(4):                                                        # power sums tr(J^k)
+            pw.append(torch.diagonal(Jp, dim1=1, dim2=2).sum(-1))
+            Jp = Jp @ J
+        e1 = pw[0]
+        e2 = (e1 * pw[0] - pw[1]) / 2.0
+        e3 = (e2 * pw[0] - e1 * pw[1] + pw[2]) / 3.0
+        e4 = (e3 * pw[0] - e2 * pw[1] + e1 * pw[2] - pw[3]) / 4.0
+        zeta = T * torch.stack([e1.abs(), e2.abs().sqrt(), e3.abs() ** (1.0 / 3.0), e4.abs() ** 0.25], -1).amax(-1)
+        gamma = 1.0 / (1.0 + (zeta / self.netCfg.local_z0) ** 4)
+        v, g, c = self.ODE(x, p), [], T
+        for k in range(K):
+            g.append(v * c)                                                       # J^k f0 · T^{k+1}/(k+1)!
+            v = (J @ v.unsqueeze(-1)).squeeze(-1)
+            c = c * T / (k + 2)
+        g = torch.stack(g, dim=1) * gamma.view(-1, 1, 1)                          # (N, K, 4)
+        g[:, 0, 0::2] = 0.0
+        return g.reshape(-1, 4 * K)
 
     @torch.no_grad()
     def _EnergyGate(self, ic_state, params_raw):

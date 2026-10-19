@@ -89,6 +89,13 @@ class NetCfg:
     warp_k: int = 0
     warp_hidden: int = 64
     warp_beta_init: float = 4.0
+    # Class split (2026-10-19, branch FiLM-MoE, vault "Class-split FiLM"). class_split = k > 0: flip cases (gate
+    #   log(e_rel/e_flip) > class_gate_center, Dataset.ClassGate = the states.py label rule, exact on the corpus) get their
+    #   own proj_in, blocks 0..k-1, FiLMCond and heads; blocks k.. share fc1 and take (γ, β) from the row's class FiLMCond.
+    #   The gate rides as the last feats column. 0 = off, state_dict unchanged. Plain film/ffn nets only.
+    # // 클래스 분리: flip 케이스는 앞단(proj_in + 블록 0..k-1)·FiLMCond·헤드가 따로, 블록 k..는 fc1 공유. 0 = 끔
+    class_split: int = 0
+    class_gate_center: float = -0.255
 
     @property
     def gx_dim(self) -> int:
@@ -155,6 +162,12 @@ class TrainCfg:
     trim_q_data: float = 0.0
     trim_q_phys: float = 0.0
     trim_q_kin: float = 0.0
+    # Class-normalized data loss (class_split nets): L = L_NF + flip_w · L_flip · EMA(L_NF) / EMA(L_flip), EMAs detached
+    #   with per-step decay class_norm_ema — each class gets the same relative weight, at the NF loss scale. False = row mean.
+    # // 클래스 정규화 data 손실: flip 손실을 NF/flip EMA 비로 맞춰 더한다 (스케일은 NF 손실). False = 행 평균
+    class_norm: bool = False
+    flip_w: float = 1.0
+    class_norm_ema: float = 0.99
 
     # IC 항 스텝당 케이스 상한 (0 = 전체 active_cases) // IC는 세그먼트마다 반복되는 항이라
     #   비용이 max_cases × n_segments로 곱셈이다 (march_dt를 줄이면 조용히 커진다).
@@ -319,6 +332,7 @@ def LoadConfig(path):
         block_acts=tuple(n.get("block_acts", [])), stream_act_at=tuple(n.get("stream_act_at", [])),
         warp_k=n.get("warp_k", 0), warp_hidden=n.get("warp_hidden", 64),
         warp_beta_init=n.get("warp_beta_init", 4.0),
+        class_split=n.get("class_split", 0), class_gate_center=n.get("class_gate_center", -0.255),
     )
 
     train_cfg = TrainCfg(
@@ -347,6 +361,8 @@ def LoadConfig(path):
         roll_target=t.get("roll_target", "label"), roll_rk4_dt=t.get("roll_rk4_dt", 0.005),
         trim_q_data=t.get("trim_q_data", 0.0), trim_q_phys=t.get("trim_q_phys", 0.0),
         trim_q_kin=t.get("trim_q_kin", 0.0),
+        class_norm=t.get("class_norm", False), flip_w=t.get("flip_w", 1.0),
+        class_norm_ema=t.get("class_norm_ema", 0.99),
         roll_balance_points=t.get("roll_balance_points", 12),
         ic_max_n=t.get("ic_max_n", 0),
         freeze_from=t.get("freeze_from", ""), freeze_below=t.get("freeze_below", 0),

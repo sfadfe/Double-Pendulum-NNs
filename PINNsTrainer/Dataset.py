@@ -100,9 +100,22 @@ class Dataset:
     def _BuildFeats(self, tau, params_raw, ic_state):
         # Flow-map features // 플로우맵 입력: τ + IC(trig,ω) + ParamEmbed(m,L)
         # params_raw는 호출자가 활성 소스에서 직접 해석해 전달 // explicit params, no hidden _replay_active dep
-        pn = self.NormParams(params_raw)
-        p_emb = self.param_embed(pn)  # Networks.ParamEmbed // option B3
+        p_emb = self.CaseEmb(params_raw, ic_state)  # Networks.ParamEmbed // option B3
         return self._FeatsOf(tau, ic_state, p_emb)
+
+    def CaseEmb(self, params_raw, ic_state):
+        # ParamEmbed(m, L), plus the class gate as a last column when class_split — case-constant, so the roll
+        #   pushforward builds it once per step from the true IC (Loss._RolloutMergedDraws).
+        # // 케이스 상수 열: param_embed (+ class_split이면 클래스 게이트 열)
+        p_emb = self.param_embed(self.NormParams(params_raw))
+        if self.class_split > 0:
+            p_emb = torch.cat([p_emb, self.ClassGate(ic_state, params_raw).to(p_emb.dtype)], dim=1)
+        return p_emb
+
+    @torch.no_grad()
+    def ClassGate(self, ic_state, params_raw):
+        # (N, 1) 1 = flip class (log(e_rel/e_flip) > class_gate_center), 0 = nonflip — the label rule itself // 클래스 게이트
+        return (self._EnergyGate(ic_state, params_raw) > self.class_gate_center).float()
 
     def _FeatsOf(self, tau, ic_state, p_emb):
         # _BuildFeats with the param embedding given — case-constant, so the roll pushforward computes it once per

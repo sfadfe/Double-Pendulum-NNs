@@ -341,6 +341,25 @@ class Networks(nn.Module):
             if self.n_tok > 0:
                 raise ValueError("warp_k: plain nets only (no xattn / window tokens)")
             self.time_warp = TimeWarp(netCfg.cond_dim, netCfg.warp_hidden, netCfg.warp_k, netCfg.warp_beta_init)
+        # Class split (config.py class_split): flip rows (gate = last feats column, Dataset.CaseEmb) take their own proj_in,
+        #   blocks 0..k-1, FiLMCond and heads; blocks k.. share fc1. Built last: the plain net's state_dict keys are
+        #   unchanged, but construction draws RNG, so the main modules' init differs from a plain net of the same seed.
+        # // 클래스 분리 — flip 전용 앞단·FiLMCond·헤드. 마지막에 생성 → 기존 키 불변 (같은 seed여도 초기값은 plain과 다름)
+        self.class_split = netCfg.class_split
+        self.class_gate_center = netCfg.class_gate_center
+        self.proj_in_f = self.blocks_f = self.film_f = self.head_theta_f = self.head_omega_f = None
+        if self.class_split > 0:
+            if (self.n_tok > 0 or self.stage_at or self.film_split_at > 0 or self.time_warp is not None
+                    or self.stream_act_at or not 1 <= self.class_split <= netCfg.n
+                    or any(t not in ("film", "ffn") for t in self.block_types)):
+                raise ValueError("class_split: plain film/ffn nets only (no stage/xattn/film_split/warp/stream_act), "
+                                 f"1 ≤ k ≤ n_blocks, got {self.class_split}")
+            self.proj_in_f = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
+            self.blocks_f = nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, a)
+                                           for t, a in zip(self.block_types[:self.class_split], self.block_acts)])
+            self.film_f = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_film)
+            self.head_theta_f = nn.Linear(width, 2)
+            self.head_omega_f = nn.Linear(width, 2)
 
         self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
         self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)
@@ -394,7 +413,7 @@ class Networks(nn.Module):
                     nn.init.normal_(lin.weight, std=1.0 / lin.weight.shape[1] ** 0.5)
 
         # FiLM 출력도 zero-init → γ=1, β=0에서 출발 (Kaiming 루프 뒤여야 함). film_corr(분리 MLP)도 동일
-        for film in (self.film, self.film_corr):
+        for film in (self.film, self.film_corr, self.film_f):
             if film is None:
                 continue
             nn.init.zeros_(film.net[-1].weight)
@@ -440,6 +459,13 @@ class Networks(nn.Module):
             k = self.film_slot[i]
             return self.blocks[i](h, gammas[k], betas[k], n_q, self.n_tok)
         return self.blocks[i](h)
+
+    def _ApplyFront(self, i, h, gammas, betas):
+        # flip-own front block i (class_split) // flip 전용 앞단 블록
+        if self.block_types[i] == "film":
+            k = self.film_slot[i]
+            return self.blocks_f[i](h, gammas[k], betas[k])
+        return self.blocks_f[i](h)
 
     def _TokenFeats(self, feats_case, cond_case):
         # (n, F) case rows → token rows (n, P, F) at τ = tau_tok with the case columns copied; cond likewise
@@ -496,6 +522,11 @@ class Networks(nn.Module):
         # warp_k > 0: (γ, β, wp) with wp (N, 3, K) — callers must treat cond as a tuple, not unpack two.
         # // 워프가 켜지면 (γ, β, wp) 3원소 — 호출부는 2개 언패킹 금지, 튜플째로 넘긴다
         c = feats[:, 1:]
+        if self.class_split > 0:   # last column = class gate, not a cond input // 마지막 열 = 클래스 게이트 (cond 아님)
+            g = (c[:, -1:] > 0.5).unsqueeze(-1)
+            c = c[:, :-1]
+            (ga, ba), (gf, bf) = self.film(c), self.film_f(c)
+            return torch.where(g, gf, ga), torch.where(g, bf, ba)
         if self.film_corr is None:
             return self.film(c) + self.WarpOf(c)
         ga, ba = self.film(c)                          # 예측 구간 슬롯
@@ -554,11 +585,20 @@ class Networks(nn.Module):
         gammas, betas = gamma.unbind(1), beta.unbind(1)
 
         h = self.proj_in(x)
+        i0 = 0
+        if self.class_split > 0:   # both fronts on every row, row picks its class (where: no grad to the other) // 행별 선택
+            g = feats[:, -1:] > 0.5
+            hf = self.proj_in_f(x)
+            for i in range(self.class_split):
+                h = self.ApplyBlock(i, h, gammas, betas, n_q)
+                hf = self._ApplyFront(i, hf, gammas, betas)
+            h = torch.where(g, hf, h)
+            i0 = self.class_split
 
         a_cum, stages, st = 0.0, [], 0
         tok_rec, j = [], 0
         # pos = 지나온 블록 수 (stage_at과 같은 1-based 경계)
-        for i in range(len(self.blocks)):
+        for i in range(i0, len(self.blocks)):
             if self.block_types[i] == "xattn" and (record or tok_hs is not None):
                 k = self.film_slot[i]
                 if record:
@@ -588,6 +628,8 @@ class Networks(nn.Module):
                 st += 1
 
         a = a_cum + torch.cat([self.head_theta(h), self.head_omega(h)], dim=-1)
+        if self.class_split > 0:
+            a = torch.where(g, torch.cat([self.head_theta_f(h), self.head_omega_f(h)], dim=-1), a)
         out = self._HardIC(a, feats, tau)               # (N, 4) [Δθ1, Δθ2, ω1, ω2]
         return out, stages, tok_rec
 

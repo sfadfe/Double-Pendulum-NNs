@@ -296,6 +296,8 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
                 "roll_ramp": self.roll_ramp,          # rollout 0→1 램프 계수 // resume 시 램프 위치 복원
                 "phys_ramp": self.phys_ramp,          # physics sigmoid ramp // resume 시 ramp 위치 복원
                 "phys_balanced": self._phys_balanced, # Phase 2 진입(첫 B 호출) 여부
+                "class_ema": self.__dict__.get("_class_ema"),    # class_norm EMA (Loss._ClassMix) // resume 시 flip 가중 복원
+                "class_seen": self.__dict__.get("_class_seen"),
                 "sched_state": sched_state,  # OdeScheduler 내부 상태 // scheduler resume 복원용
             },
             tmp,
@@ -352,4 +354,7 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         self.roll_ramp = ckpt.get("roll_ramp", self.roll_ramp)
         self.phys_ramp = ckpt.get("phys_ramp", self.phys_ramp)
         self._phys_balanced = ckpt.get("phys_balanced", self._phys_balanced)
+        if ckpt.get("class_ema") is not None:
+            self.__dict__["_class_ema"] = ckpt["class_ema"].to(self.device)
+            self.__dict__["_class_seen"] = ckpt["class_seen"].to(self.device)
         return ckpt["step"], ckpt["metric"], ckpt.get("sched_state", None)

@@ -135,7 +135,7 @@ class Dataset:
         Jp, pw = J, []
         for _ in range(4):                                                        # power sums tr(J^k)
             pw.append(torch.diagonal(Jp, dim1=1, dim2=2).sum(-1))
-            Jp = Jp @ J
+            Jp = (Jp.unsqueeze(-1) * J.unsqueeze(1)).sum(2)                       # Jp @ J, broadcast (trap 34)
         e1 = pw[0]
         e2 = (e1 * pw[0] - pw[1]) / 2.0
         e3 = (e2 * pw[0] - e1 * pw[1] + pw[2]) / 3.0
@@ -145,7 +145,7 @@ class Dataset:
         v, g, c = self.ODE(x, p), [], T
         for k in range(K):
             g.append(v * c)                                                       # J^k f0 · T^{k+1}/(k+1)!
-            v = (J @ v.unsqueeze(-1)).squeeze(-1)
+            v = (J * v.unsqueeze(1)).sum(-1)                                      # J @ v, broadcast (trap 34)
             c = c * T / (k + 2)
         g = torch.stack(g, dim=1) * gamma.view(-1, 1, 1)                          # (N, K, 4)
         g[:, 0, 0::2] = 0.0

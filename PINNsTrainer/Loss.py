@@ -201,7 +201,7 @@ class Loss:
         n_draws = max(1, int(getattr(self.trainCfg, "roll_draws", 1)))
         if n_draws == 1 or case_idx.shape[0] < 2 * n_draws:
             return self._RobustRollMean(self._RolloutPerCase(case_idx, depth, n_points))
-        return self._RobustRollMean(self._RolloutMergedDraws(case_idx, n_draws, n_points))
+        return self._RobustRollMean(*self._RolloutMergedDraws(case_idx, n_draws, n_points))
 
     def _RolloutMergedDraws(self, case_idx, n_draws, n_points):
         # All draws in one batch. Per-draw (k0, depth) become per-case vectors; the
@@ -248,6 +248,17 @@ class Loss:
 
         kg_c = k0_c + depth_c
         i_start_c = torch.round(kg_c.double() * md / dt).long()
+        keep = None
+        cap = self.trainCfg.roll_omega_cap
+        if cap > 0.0:
+            # trap 34: a diverged case (non-finite or |ω| > cap) gets weight 0 in the mean, and its IC is swapped to the
+            #   stored state so the grad-window forward and the RK4 target stay finite (0 × NaN in backward is NaN).
+            # // 발산 케이스: 평균 가중치 0, IC는 저장 상태로 교체 — 스텝 전체 NaN skip 방지
+            keep = torch.isfinite(state).all(1) & (state[:, 1::2].abs().amax(1) <= cap)
+            st_true = data[ci, i_start_c.to(ci.device)][:, [1, 2, 3, 4]].to(dev)
+            state = torch.where(keep.unsqueeze(1), state, st_true)
+            n_dead = torch.stack([(~keep).sum().float(), torch.full((), float(keep.numel()), device=dev)])
+            self.__dict__["_roll_dead"] = self.__dict__.get("_roll_dead", 0.0) + n_dead   # [excluded, total] per epoch
         n_seg = int(round(md / dt))                                # 윈도우 격자 길이 — 전 케이스 동일
         off = torch.arange(1, n_seg + 1, device=dev)               # exclude τ=0, include end
         if off.numel() > n_points:
@@ -275,7 +286,7 @@ class Loss:
             omega_true = seg[:, :, [2, 4]]
         return ((theta_pred - theta_true) ** 2).mean(dim=(1, 2)) + (
             (omega_pred - omega_true) ** 2
-        ).mean(dim=(1, 2))
+        ).mean(dim=(1, 2)), keep
 
     def _RollRk4Target(self, state, params, off, key):
         # roll_target="rk4": target of the grad window = RK4 over the window from the marched IC, Φ(x̂_n), instead of
@@ -362,7 +373,7 @@ class Loss:
             (omega_pred - omega_true) ** 2
         ).mean(dim=(1, 2))
 
-    def _RobustRollMean(self, per_case):
+    def _RobustRollMean(self, per_case, keep=None):
         # Heavy-tail 억제: 발산 케이스 소수가 평균을 독식 → 그 스텝 gradient를 통째로 강탈.
         #   측정(88ep finetune): flip 에폭의 44%가 평균 roll>100, 중앙값은 ~7 — 3~5자리 tail.
         #   clip_grad_norm_은 전 항 합산 후 걸리므로 이때 data/phys/kin gradient가 사실상 소거됨.
@@ -372,14 +383,19 @@ class Loss:
         # c의 median EMA(roll_median_ema>0): 스케일 자체가 스텝마다 흔들리면 그것도 노이즈원이라
         #   같은 손실값이 스텝마다 다른 gradient 크기를 갖는다. EMA면 c가 학습 진행은 따라가되
         #   추첨 노이즈는 빠진다. detach 유지 — c는 상수 취급.
+        # keep (roll_omega_cap, trap 34): excluded cases get weight 0 in the mean and leave the median
+        # // 제외 케이스는 평균 가중치 0, median에서도 제외
+        def Mean(x):
+            return x.mean() if keep is None else (x * keep).sum() / keep.sum().clamp_min(1)
+
         k = self.trainCfg.roll_robust_k
         if k <= 0.0:
-            return per_case.mean()                      # 0 → 기존 순수 평균 // opt-out
+            return Mean(per_case)                       # 0 → 기존 순수 평균 // opt-out
         # nanmedian + skip EMA update when med is non-finite: torch.median propagates NaN, and one diverged
         #   draw would write NaN into _roll_median → c=NaN → every later step skipped as "[NaN] roll" with
         #   weights frozen. where → no host sync.
         # // NaN draw는 median에서 제외, med 비유한이면 EMA는 직전 값 유지 — 1스텝 오염이 영구 교착이 됐던 버그
-        med = per_case.detach().nanmedian()
+        med = (per_case.detach() if keep is None else torch.where(keep, per_case.detach(), float("nan"))).nanmedian()
         beta = getattr(self.trainCfg, "roll_median_ema", 0.0)
         if beta > 0.0:
             prev = self.__dict__.get("_roll_median")
@@ -397,5 +413,5 @@ class Loss:
                 per_case <= c, per_case,
                 2.0 * torch.sqrt(c * per_case.clamp_min(c)) - c,
             )
-            return robust.mean()
-        return (c * torch.log1p(per_case / c)).mean()
+            return Mean(robust)
+        return Mean(c * torch.log1p(per_case / c))

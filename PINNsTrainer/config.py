@@ -156,6 +156,10 @@ class TrainCfg:
     #   // roll 타깃: "label" = 참 궤적, "rk4" = 마칭 IC에서 RK4로 적분한 한 창 (넷 자체 오차만 남김)
     roll_target: str = "label"
     roll_rk4_dt: float = 0.005
+    # Roll cases whose pushforward state is non-finite or has |ω| > cap leave the roll mean (weight 0, grad-window IC
+    #   swapped to the stored state so the forward stays finite); 0 = off. One such case made the step's loss NaN and
+    #   the whole step was skipped (trap 34). // 발산 케이스 roll 평균에서 제외, 0 = 끔
+    roll_omega_cap: float = 0.0
     # Drop the top-q fraction of rows (by per-row loss) from each term's gradient (0 = plain mean) // 손실 상위 q 행을
     #   grad에서 제외. 상위 소수 행이 손실·grad 노이즈를 지배해서. 분위는 청크(배치)별.
     trim_q_data: float = 0.0
@@ -352,6 +356,7 @@ def LoadConfig(path):
         roll_median_ema=t.get("roll_median_ema", 0.0),
         roll_robust_kind=t.get("roll_robust_kind", "cauchy"),
         roll_target=t.get("roll_target", "label"), roll_rk4_dt=t.get("roll_rk4_dt", 0.005),
+        roll_omega_cap=t.get("roll_omega_cap", 0.0),
         trim_q_data=t.get("trim_q_data", 0.0), trim_q_phys=t.get("trim_q_phys", 0.0),
         trim_q_kin=t.get("trim_q_kin", 0.0),
         roll_balance_points=t.get("roll_balance_points", 12),

@@ -829,6 +829,10 @@ def RunTrainLoop(
                 avg["phys"] = avg["energy"] = float("nan")
             if not roll_on:
                 avg["roll"] = float("nan")
+            roll_dead = trainer.__dict__.pop("_roll_dead", None)   # roll_omega_cap exclusions, trap 34 // 제외 케이스 수
+            if roll_dead is not None and float(roll_dead[0]) > 0:
+                tqdm.write(f"[roll_dead] epoch {epoch}  {int(roll_dead[0])}/{int(roll_dead[1])} roll cases excluded "
+                           f"(non-finite or |ω| > {trainer.trainCfg.roll_omega_cap:g})")
             if not trainer.WarpSupOn():
                 avg["warp"] = float("nan")
 

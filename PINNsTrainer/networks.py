@@ -353,32 +353,49 @@ class Networks(nn.Module):
         #   Built after the 2-way modules → class_routes 2 keeps the bff4b74 keys and init draws.
         # // K경로: 0 = 본 모듈, 1 = *_f, 2.. = routes_x. 2경로면 bff4b74와 키·초기화 난수 동일
         self.class_routes = netCfg.class_routes if self.class_split > 0 else 0
+        # Shared stem (config.py route_at = a): proj_in, blocks 0..a-1 and their FiLM slots shared, route-own blocks
+        #   a..a+k-1 and FiLM slots from a on. route_by "scale": no router, ScaleScores picks the route. a = 0 builds the
+        #   same modules in the same order as before. // 공유 몸통 a블록, 경로 전용 블록 a..a+k-1. a = 0이면 종전과 동일
+        self.route_at = netCfg.route_at if self.class_split > 0 else 0
+        self.route_scale = self.class_split > 0 and netCfg.route_by == "scale"
+        self.route_pts = netCfg.route_pts
+        self.n_stem_slots = 0
         self.routes_x = self.warps_x = self.router = None
         if self.class_split > 0:
+            a, k_own = self.route_at, self.class_split
             if (self.n_tok > 0 or self.stage_at or self.film_split_at > 0
-                    or self.stream_act_at or not 1 <= self.class_split <= netCfg.n
+                    or self.stream_act_at or not 1 <= k_own <= netCfg.n - a or a < 0
                     or any(t not in ("film", "ffn") for t in self.block_types)):
                 raise ValueError("class_split: plain film/ffn nets only (no stage/xattn/film_split/stream_act), "
-                                 f"1 ≤ k ≤ n_blocks, got {self.class_split}")
-            if self.class_routes not in (2, 3):
+                                 f"1 ≤ k ≤ n_blocks − route_at, got k {k_own}, route_at {a}")
+            if netCfg.route_by not in ("router", "scale"):
+                raise ValueError(f"route_by must be 'router' or 'scale', got {netCfg.route_by!r}")
+            if self.route_scale and (self.class_routes < 2 or a < 1 or self.route_pts < 1):
+                raise ValueError("route_by 'scale': class_routes ≥ 2, route_at ≥ 1 (block 0 reads τ only), route_pts ≥ 1")
+            if not self.route_scale and self.class_routes not in (2, 3):
                 raise ValueError(f"class_routes must be 2 (energy gate) or 3 (router), got {self.class_routes}")
-            self.proj_in_f = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
-            self.blocks_f = nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, a)
-                                           for t, a in zip(self.block_types[:self.class_split], self.block_acts)])
-            self.film_f = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_film)
+            self.n_stem_slots = sum(1 for t in self.block_types[:a] if t in ("film", "xattn"))
+            n_rf = n_film - self.n_stem_slots              # route FiLM slots // 경로 FiLM 슬롯 수
+            own = list(zip(self.block_types[a:a + k_own], self.block_acts[a:a + k_own]))
+            if a == 0:
+                self.proj_in_f = nn.Sequential(nn.Linear(gx, width), nn.SiLU())
+            self.blocks_f = nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, act)
+                                           for t, act in own])
+            self.film_f = FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_rf)
             self.head_theta_f = nn.Linear(width, 2)
             self.head_omega_f = nn.Linear(width, 2)
             if self.class_routes > 2:
                 self.routes_x = nn.ModuleList([nn.ModuleDict({
-                    "proj_in": nn.Sequential(nn.Linear(gx, width), nn.SiLU()),
-                    "blocks": nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, a)
-                                             for t, a in zip(self.block_types[:self.class_split], self.block_acts)]),
-                    "film": FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_film),
+                    **({"proj_in": nn.Sequential(nn.Linear(gx, width), nn.SiLU())} if a == 0 else {}),
+                    "blocks": nn.ModuleList([self._MakeBlock(t, width, netCfg.attn_tokens, netCfg.xattn_heads, act)
+                                             for t, act in own]),
+                    "film": FiLMCond(netCfg.cond_dim, netCfg.film_hidden, width, n_rf),
                     "head_theta": nn.Linear(width, 2),
                     "head_omega": nn.Linear(width, 2),
                 }) for _ in range(self.class_routes - 2)])
-                self.router = nn.Sequential(nn.Linear(netCfg.cond_dim, netCfg.route_hidden), nn.SiLU(),
-                                            nn.Linear(netCfg.route_hidden, self.class_routes))
+                if not self.route_scale:
+                    self.router = nn.Sequential(nn.Linear(netCfg.cond_dim, netCfg.route_hidden), nn.SiLU(),
+                                                nn.Linear(netCfg.route_hidden, self.class_routes))
             if self.time_warp is not None:
                 self.warps_x = nn.ModuleList([
                     TimeWarp(netCfg.cond_dim, netCfg.warp_hidden, netCfg.warp_k, netCfg.warp_beta_init)
@@ -489,19 +506,48 @@ class Networks(nn.Module):
         return self.blocks[i](h)
 
     def _ApplyFront(self, blocks, i, h, gammas, betas):
-        # route-own front block i of a route r ≥ 1 (class_split) // 경로 전용 앞단 블록
+        # route-own block i (trunk index, route_at ≤ i < route_at + class_split) of a route r ≥ 1 // 경로 전용 블록
         if self.block_types[i] == "film":
             k = self.film_slot[i]
-            return blocks[i](h, gammas[k], betas[k])
-        return blocks[i](h)
+            return blocks[i - self.route_at](h, gammas[k], betas[k])
+        return blocks[i - self.route_at](h)
 
     def RouteMods(self, r):
-        # route r ≥ 1 → (proj_in, front blocks, FiLMCond, head_theta, head_omega, warp or None) // 경로 r의 전용 모듈
+        # route r ≥ 1 → (proj_in or None (shared stem), own blocks, FiLMCond, head_theta, head_omega, warp or None)
+        # // 경로 r의 전용 모듈 (공유 몸통이면 proj_in None)
         w = None if self.warps_x is None else self.warps_x[r - 1]
         if r == 1:
             return self.proj_in_f, self.blocks_f, self.film_f, self.head_theta_f, self.head_omega_f, w
         m = self.routes_x[r - 2]
-        return m["proj_in"], m["blocks"], m["film"], m["head_theta"], m["head_omega"], w
+        return m["proj_in"] if "proj_in" in m else None, m["blocks"], m["film"], m["head_theta"], m["head_omega"], w
+
+    @torch.no_grad()
+    def ScaleScores(self, c):
+        # route_by "scale": c (n, cond_dim) window cond inputs → (n, K) route e's own activation size
+        #   Σ_j ‖SiLU(fc1 h)‖² at its first own block (trunk block route_at), h = the shared stem under route e's warp σ_e
+        #   at τ_j = (j + ½)·march_dt/route_pts — the h that block sees in forward for a row on route e. No router: the
+        #   expert's own size picks it (AoE). τ-free → window-constant, τ-jvp safe.
+        # // 경로 e의 첫 전용 블록 활성 크기 (몸통은 e의 워프로, τ 격자 합) — 창 상수
+        n, p, a = c.shape[0], self.route_pts, self.route_at
+        tau = ((torch.arange(p, device=c.device, dtype=c.dtype) + 0.5) * (self.march_dt / p)).repeat(n).unsqueeze(1)
+        cc = c.repeat_interleave(p, dim=0)
+        gamma, beta = self.film(cc)
+        gammas, betas = gamma.unbind(1), beta.unbind(1)
+        out, h_raw = [], None
+        for e in range(self.class_routes):
+            warp = self.time_warp if e == 0 else (None if self.warps_x is None else self.warps_x[e - 1])
+            if warp is None and h_raw is not None:      # no warp: one stem for every route // 워프 없으면 몸통 1회
+                h = h_raw
+            else:
+                sig = tau if warp is None else TimeWarp.Sigma(tau, warp(cc), self.march_dt)
+                h = self.proj_in(torch.cat([self.fourier(sig), 2.0 * sig / self.march_dt - 1.0], dim=-1))
+                for i in range(a):
+                    h = self.ApplyBlock(i, h, gammas, betas)
+                if warp is None:
+                    h_raw = h
+            blk = self.blocks[a] if e == 0 else self.RouteMods(e)[1][0]
+            out.append(blk.act(blk.Fc1(h)).pow(2).sum(-1).view(n, p).sum(1))
+        return torch.stack(out, dim=1)
 
     def _TokenFeats(self, feats_case, cond_case):
         # (n, F) case rows → token rows (n, P, F) at τ = tau_tok with the case columns copied; cond likewise
@@ -561,8 +607,11 @@ class Networks(nn.Module):
         if self.class_split > 0:   # last column = route id, not a cond input // 마지막 열 = 경로 id (cond 아님)
             r = c[:, -1:].round().unsqueeze(-1)
             ga, ba = self.film(c[:, :-1])
+            ns = self.n_stem_slots
             for k in range(1, self.class_routes):
                 gk, bk = self.RouteMods(k)[2](c[:, :-1])
+                if ns > 0:   # stem slots stay shared // 몸통 슬롯은 공유 FiLMCond
+                    gk, bk = torch.cat([ga[:, :ns], gk], dim=1), torch.cat([ba[:, :ns], bk], dim=1)
                 ga, ba = torch.where(r == k, gk, ga), torch.where(r == k, bk, ba)
             return ga, ba, *self.WarpOf(c)
         if self.film_corr is None:
@@ -631,17 +680,21 @@ class Networks(nn.Module):
 
         h = self.proj_in(x)
         i0 = 0
-        if self.class_split > 0:   # every route's front on every row, row picks its route (where: no grad to the others)
-            r = feats[:, -1:].round()   # // 경로별 앞단 전부 계산 후 행별 선택
-            for i in range(self.class_split):
+        if self.class_split > 0:   # shared stem, then every route's own blocks on every row, row picks its route
+            r = feats[:, -1:].round()   # (where: no grad to the others) // 공유 몸통 → 경로별 전용 블록 전부 계산 후 행별 선택
+            a, k_own = self.route_at, self.class_split
+            for i in range(a):
+                h = self.ApplyBlock(i, h, gammas, betas, n_q)
+            h_stem = h
+            for i in range(a, a + k_own):
                 h = self.ApplyBlock(i, h, gammas, betas, n_q)
             for k in range(1, self.class_routes):
                 proj, blocks = self.RouteMods(k)[:2]
-                hk = proj(x)
-                for i in range(self.class_split):
+                hk = h_stem if proj is None else proj(x)
+                for i in range(a, a + k_own):
                     hk = self._ApplyFront(blocks, i, hk, gammas, betas)
                 h = torch.where(r == k, hk, h)
-            i0 = self.class_split
+            i0 = a + k_own
 
         a_cum, stages, st = 0.0, [], 0
         tok_rec, j = [], 0

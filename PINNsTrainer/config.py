@@ -104,6 +104,16 @@ class NetCfg:
     # // K경로: 2 = 에너지 게이트 flip/NF, 3 = 라우터(창 시작 상태) NF / flip 비회전 / flip 회전 창, 경로마다 워프
     class_routes: int = 2
     route_hidden: int = 64
+    # Shared stem + scale routing (2026-10-20, branch FiLM-MoE). route_at = a > 0: proj_in and blocks 0..a-1 are shared
+    #   by every route (stem FiLM slots from the shared FiLMCond), the route-own blocks are a..a+class_split-1, then the
+    #   shared back; own FiLMCond slots, heads and warp as above. route_by "router" = as above; "scale" = no router, the
+    #   window route is argmax_e of route e's own activation size Σ_j ‖SiLU(fc1 h_a)‖² at its first own block, h_a = the
+    #   stem under route e's warp at route_pts τ points (AoE-style, Networks.ScaleScores; needs a ≥ 1 — block 0 reads τ
+    #   only, scratch/aoe_depth_probe.log: windows separate from block 3 on). Window-constant, recomputed per window.
+    # // 공유 몸통(블록 0..a-1) 뒤 경로 전용 블록. scale: 라우터 없이 expert 자기 활성 크기로 창 경로 선택
+    route_at: int = 0
+    route_by: str = "router"
+    route_pts: int = 4
 
     @property
     def gx_dim(self) -> int:
@@ -179,7 +189,8 @@ class TrainCfg:
     # Router supervision (NetCfg.class_routes ≥ 3): CE of the router on route_sup_cases random (case, window start)
     #   pairs of active_cases per step, labels Trainstep.RouteLabels from the corpus path. Input detached → only the
     #   router learns; weight route_sup, outside RebalanceGradScales. Logged as AvgLoss_Route / RouteBacc.
-    # // 라우터 CE 감독 — 라우터만 학습, 밸런서 밖
+    #   route_by "scale": no CE, route_sup_cases windows per step only for the RouteBacc / RouteLoad diagnostics.
+    # // 라우터 CE 감독 — 라우터만 학습, 밸런서 밖. scale이면 진단(RouteBacc·RouteLoad)용 추첨 수만
     route_sup: float = 1.0
     route_sup_cases: int = 4096
 
@@ -348,6 +359,7 @@ def LoadConfig(path):
         warp_beta_init=n.get("warp_beta_init", 4.0),
         class_split=n.get("class_split", 0), class_gate_center=n.get("class_gate_center", -0.255),
         class_routes=n.get("class_routes", 2), route_hidden=n.get("route_hidden", 64),
+        route_at=n.get("route_at", 0), route_by=n.get("route_by", "router"), route_pts=n.get("route_pts", 4),
     )
 
     train_cfg = TrainCfg(

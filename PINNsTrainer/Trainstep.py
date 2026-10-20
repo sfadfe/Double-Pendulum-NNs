@@ -445,6 +445,10 @@ class LambdaBalance:
     def RouteSupOn(self):
         return self.router is not None and self.trainCfg.route_sup_cases > 0
 
+    def RouteStatOn(self):
+        # RouteBacc / RouteLoad logged: router nets (with the CE) and scale-routed nets (diagnostics only) // 경로 진단 로그
+        return (self.router is not None or self.route_scale) and self.trainCfg.route_sup_cases > 0
+
     def CaseRotates(self):
         # (n_case,) bool: the case's corpus path passes over the top at least once — flip by behaviour, not by the
         #   energy gate. Cached per active source, chunked (the corpus may sit on the CPU). // 케이스가 한 번이라도 넘어가나
@@ -466,10 +470,9 @@ class LambdaBalance:
         cross = (kk.amax(1) != kk.amin(1)).any(1)
         return torch.where(cross, 2, self.CaseRotates()[cases].long())
 
-    def RouteSupLoss(self, n):
-        # CE of the router on n random (case, window start) pairs of active_cases, the input detached → only the router
-        #   learns. Also the batch balanced accuracy (mean recall over the routes present) for the log.
-        # // 창 시작 n개 추첨 → 라우터 CE (+ 균형 정확도, 로그용)
+    def _RouteDraw(self, n):
+        # n random (case, window start) pairs of active_cases → (labels (n,), detached route inputs (n, cond_dim))
+        # // 창 시작 n개 추첨 → 라벨, 경로 입력
         dev = self.device
         m = int(round(self.dataCfg.march_dt / self.dt))
         data, _ = self._ActiveSource()
@@ -484,6 +487,14 @@ class LambdaBalance:
         lab = self.RouteLabels(seg, cases)
         with torch.no_grad():
             x = self.RouteIn(seg[:, 0, 1:5], self.param_embed(self.NormParams(self._ParamsAt(cases))))
+        return lab, x
+
+    def RouteSupLoss(self, n):
+        # CE of the router on n random (case, window start) pairs of active_cases, the input detached → only the router
+        #   learns. Also the batch balanced accuracy (mean recall over the routes present) for the log.
+        # // 창 시작 n개 추첨 → 라우터 CE (+ 균형 정확도, 로그용)
+        dev = self.device
+        lab, x = self._RouteDraw(n)
         logits = self.router(x)
         k = self.class_routes
         hit = torch.zeros(k, device=dev).index_add_(0, lab, (logits.argmax(1) == lab).float())
@@ -491,9 +502,26 @@ class LambdaBalance:
         bacc = (hit / cnt.clamp_min(1.0)).sum() / (cnt > 0).sum().clamp_min(1)
         return torch.nn.functional.cross_entropy(logits, lab), bacc.detach()
 
+    @torch.no_grad()
+    def RouteScaleStats(self, n):
+        # Scale-routed nets, no loss: on n random window starts, the balanced accuracy of the best route → label map
+        #   (Σ_e max_l P(e | l) / #labels; 1/#labels = routes carry no label information, 1 = routes are the labels) and
+        #   the largest route share (1 = collapsed onto one expert). // scale 경로: 라벨 대비 Bayes 균형 정확도, 최대 부하
+        lab, x = self._RouteDraw(n)
+        pred = self.ScaleScores(x).argmax(1)
+        k = self.class_routes
+        cnt = torch.zeros(3, k, device=self.device).index_put_((lab, pred), torch.ones_like(pred, dtype=torch.float),
+                                                               accumulate=True)
+        tot = cnt.sum(1)
+        bacc = (cnt / tot.clamp_min(1.0).unsqueeze(1)).amax(0).sum() / (tot > 0).sum().clamp_min(1)
+        return bacc, cnt.sum(0).amax() / len(pred)
+
     def _RouteSupTerm(self, acc, budget, losses):
         # Backward + flush of the router CE (unnamed flush as _WarpSupTerm: no grad-norm slot, scale 1, fp32 MLP)
         # // 라우터 CE backward·flush
+        if self.route_scale and self.RouteStatOn():   # scale routes: diagnostics only, no backward // 진단만
+            losses["route_bacc"], losses["route_load"] = self.RouteScaleStats(self.trainCfg.route_sup_cases)
+            return
         if not self.RouteSupOn():
             return
         l_r, bacc = self.RouteSupLoss(self.trainCfg.route_sup_cases)

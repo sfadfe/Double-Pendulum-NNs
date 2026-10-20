@@ -108,8 +108,9 @@ class Dataset:
         #   per step from the true IC (Loss._RolloutMergedDraws) and refreshes it per round (RouteRefresh).
         # // 케이스 상수 열: param_embed (+ class_split이면 클래스 게이트 열)
         p_emb = self.param_embed(self.NormParams(params_raw))
-        if self.class_split > 0:   # route column: energy gate (2 routes) or router (class_routes 3) // 경로 열
-            gate = self.ClassGate(ic_state, params_raw) if self.router is None else self.RouteOf(ic_state, p_emb)
+        if self.class_split > 0:   # route column: energy gate (2 routes), router (class_routes 3) or scale // 경로 열
+            gate = (self.ClassGate(ic_state, params_raw) if self.router is None and not self.route_scale
+                    else self.RouteOf(ic_state, p_emb, Dedupe=True))
             p_emb = torch.cat([p_emb, gate.to(p_emb.dtype)], dim=1)
         return p_emb
 
@@ -119,15 +120,23 @@ class Dataset:
         return torch.cat([x.to(p_emb.dtype), p_emb], dim=1)
 
     @torch.no_grad()
-    def RouteOf(self, ic_state, p_emb):
+    def RouteOf(self, ic_state, p_emb, Dedupe=False):
         # (N, 1) route id = argmax Router(window-start state): 0 NF, 1 flip not over the top, 2 over the top in the
-        #   window (labels Trainstep.RouteLabels). Window-constant → τ-jvp safe. // 창 시작 상태 → 경로 id
-        return self.router(self.RouteIn(ic_state, p_emb)).argmax(dim=1, keepdim=True).float()
+        #   window (labels Trainstep.RouteLabels); route_by "scale": argmax Networks.ScaleScores. Window-constant →
+        #   τ-jvp safe. Dedupe: score each distinct window once (rows of a window share the input; eager callers only —
+        #   data-dependent shape). // 창 시작 상태 → 경로 id. Dedupe = 같은 창 행은 1회만 계산
+        x = self.RouteIn(ic_state, p_emb)
+        if not self.route_scale:
+            return self.router(x).argmax(dim=1, keepdim=True).float()
+        if Dedupe:
+            u, inv = torch.unique(x, dim=0, return_inverse=True)
+            return self.ScaleScores(u).argmax(dim=1, keepdim=True).float()[inv]
+        return self.ScaleScores(x).argmax(dim=1, keepdim=True).float()
 
     def RouteRefresh(self, state, p_emb):
-        # roll pushforward: the route column from the current window-start state (router nets; the energy gate is
+        # roll pushforward: the route column from the current window-start state (router / scale nets; the energy gate is
         #   conserved, so 2-route nets keep the k0 column) // 라운드마다 경로 열 갱신
-        if self.router is None:
+        if self.router is None and not self.route_scale:
             return p_emb
         return torch.cat([p_emb[:, :-1], self.RouteOf(state, p_emb[:, :-1])], dim=1)
 

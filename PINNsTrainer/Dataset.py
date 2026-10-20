@@ -104,13 +104,32 @@ class Dataset:
         return self._FeatsOf(tau, ic_state, p_emb)
 
     def CaseEmb(self, params_raw, ic_state):
-        # ParamEmbed(m, L), plus the class gate as a last column when class_split — case-constant, so the roll
-        #   pushforward builds it once per step from the true IC (Loss._RolloutMergedDraws).
+        # ParamEmbed(m, L), plus the route id as a last column when class_split — the roll pushforward builds it once
+        #   per step from the true IC (Loss._RolloutMergedDraws) and refreshes it per round (RouteRefresh).
         # // 케이스 상수 열: param_embed (+ class_split이면 클래스 게이트 열)
         p_emb = self.param_embed(self.NormParams(params_raw))
-        if self.class_split > 0:
-            p_emb = torch.cat([p_emb, self.ClassGate(ic_state, params_raw).to(p_emb.dtype)], dim=1)
+        if self.class_split > 0:   # route column: energy gate (2 routes) or router (class_routes 3) // 경로 열
+            gate = self.ClassGate(ic_state, params_raw) if self.router is None else self.RouteOf(ic_state, p_emb)
+            p_emb = torch.cat([p_emb, gate.to(p_emb.dtype)], dim=1)
         return p_emb
+
+    def RouteIn(self, ic_state, p_emb):
+        # router input = the cond columns [trig θ, ω/ω_rms, param_embed] of _FeatsOf // 라우터 입력 = cond 열
+        x = torch.cat([self.GetTrigs(ic_state), ic_state[:, 1::2] / self.omega_rms], dim=1)
+        return torch.cat([x.to(p_emb.dtype), p_emb], dim=1)
+
+    @torch.no_grad()
+    def RouteOf(self, ic_state, p_emb):
+        # (N, 1) route id = argmax Router(window-start state): 0 NF, 1 flip not over the top, 2 over the top in the
+        #   window (labels Trainstep.RouteLabels). Window-constant → τ-jvp safe. // 창 시작 상태 → 경로 id
+        return self.router(self.RouteIn(ic_state, p_emb)).argmax(dim=1, keepdim=True).float()
+
+    def RouteRefresh(self, state, p_emb):
+        # roll pushforward: the route column from the current window-start state (router nets; the energy gate is
+        #   conserved, so 2-route nets keep the k0 column) // 라운드마다 경로 열 갱신
+        if self.router is None:
+            return p_emb
+        return torch.cat([p_emb[:, :-1], self.RouteOf(state, p_emb[:, :-1])], dim=1)
 
     @torch.no_grad()
     def ClassGate(self, ic_state, params_raw):

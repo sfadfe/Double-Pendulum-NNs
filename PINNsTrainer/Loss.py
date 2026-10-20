@@ -127,32 +127,32 @@ class Loss:
         return self._Compiled("data", self._DataLossImpl)(feats, theta_true, omega_true, n_q)
 
     def _DataLossClassImpl(self, feats, theta_true, omega_true, n_q=1):
-        # Per-class TF loss (TrainCfg.class_norm): NF and flip row means and row counts, class = gate column
-        # // 클래스별 data 손실 평균 (게이트 열 = feats 마지막 열)
+        # Per-route TF loss (TrainCfg.class_norm): row means (K,) and row counts (K,) per route, route = last feats column
+        # // 경로별 data 손실 평균 (경로 열 = feats 마지막 열)
         if self.class_split <= 0 or self.trainCfg.trim_q_data > 0.0 or self.stage_w > 0 and self.stage_at:
             raise ValueError("class_norm needs class_split > 0, trim_q_data 0 and no stage supervision")
         out = self(feats, n_q=n_q)
         row = ((out[:, :2] - theta_true) ** 2).mean(dim=1) + ((out[:, 2:] - omega_true) ** 2).mean(dim=1)
-        fl = (feats[:, -1] > 0.5).to(row.dtype)
-        n_f = fl.sum()
-        n_n = fl.numel() - n_f
-        return (row * (1.0 - fl)).sum() / n_n.clamp_min(1.0), (row * fl).sum() / n_f.clamp_min(1.0), n_n, n_f
+        r = feats[:, -1].round()
+        mask = [(r == k).to(row.dtype) for k in range(self.class_routes)]
+        n = torch.stack([mk.sum() for mk in mask])
+        return torch.stack([(row * mk).sum() for mk in mask]) / n.clamp_min(1.0), n
 
-    def _ClassMix(self, l_n, l_f, n_n, n_f):
-        # L_NF + flip_w · L_flip · EMA(L_NF) / EMA(L_flip). EMAs are detached; a class absent from the batch keeps its
-        #   EMA and adds 0; the first batch that has a class seeds its EMA. torch.where only — no host sync.
-        # // EMA 비로 flip 손실을 NF 스케일에 맞춰 더한다. 배치에 없는 클래스는 EMA 유지·기여 0
+    def _ClassMix(self, l, n):
+        # L_0 + flip_w · Σ_k≥1 L_k · EMA(L_0) / EMA(L_k), route 0 = NF. EMAs are detached; a route absent from the batch
+        #   keeps its EMA and adds 0; the first batch that has a route seeds its EMA. torch.where only — no host sync.
+        # // EMA 비로 경로 1.. 손실을 NF 스케일에 맞춰 더한다. 배치에 없는 경로는 EMA 유지·기여 0
         b = self.trainCfg.class_norm_ema
-        cur = torch.stack([l_n.detach(), l_f.detach()])
-        has = torch.stack([n_n > 0, n_f > 0])
+        cur = l.detach()
+        has = n > 0
         prev = self.__dict__.get("_class_ema")
         seen = self.__dict__.get("_class_seen")
-        if prev is None:
+        if prev is None or prev.shape != cur.shape:   # fresh, or a ckpt EMA of another route count // 새로 시작
             prev, seen = torch.zeros_like(cur), torch.zeros_like(has)
         ema = torch.where(has & ~seen, cur, torch.where(has, b * prev + (1.0 - b) * cur, prev))
         self.__dict__["_class_ema"], self.__dict__["_class_seen"] = ema, seen | has
-        ratio = ema[0] / ema[1].clamp_min(1e-30)
-        return l_n + torch.where(n_f > 0, self.trainCfg.flip_w * ratio * l_f, torch.zeros_like(l_f))
+        ratio = ema[0] / ema[1:].clamp_min(1e-30)
+        return l[0] + torch.where(has[1:], self.trainCfg.flip_w * ratio * l[1:], torch.zeros_like(l[1:])).sum()
 
     def _DataLossImpl(self, feats, theta_true, omega_true, n_q=1):
         out, stages = self(feats, Stages=True, n_q=n_q)   # (N, 4), [x̂_k]  (n_q: xattn 케이스 묶음)
@@ -270,7 +270,7 @@ class Loss:
             # case-constant feats once per step, then one compiled round per window (Trainstep._RollRound)
             # // 케이스 상수 열(τ, param_embed)은 스텝당 1회, 라운드는 compile 1개
             tau_col = torch.full((state.shape[0], 1), md, device=dev)
-            p_emb = self.CaseEmb(params, state)                    # class gate from the true IC at k0
+            p_emb = self.CaseEmb(params, state)                    # route from the true IC at k0, refreshed per round
             rem = depth_c.unsqueeze(1)                             # (n,1) 남은 라운드 — ≤ 0이면 고정
             for _ in range(max_depth):
                 state, rem = self._RollRound(state, p_emb, tau_col, rem)

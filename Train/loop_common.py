@@ -29,6 +29,8 @@ CSV_HEADER = [
     "RollTauMax", "RollTauArgmax", "RollSeamJump", "RollTauMaxBest",
     # time warp (NetCfg.warp_k): MSE of μ_1 vs its label (warp_sup_label) over labeled windows, window units // 워프 첫 딥 중심 오차
     "AvgLoss_Warp",
+    # class routes (NetCfg.class_routes ≥ 3): router CE and batch balanced accuracy over the routes // 라우터 CE·균형 정확도
+    "AvgLoss_Route", "RouteBacc",
 ]
 
 
@@ -642,7 +644,7 @@ def RunTrainLoop(
     try:
         for epoch in pbar:
             epoch_sums = {k: torch.tensor(0.0, device=device)
-                          for k in ["data", "kin", "phys", "energy", "ic", "roll", "warp"]}
+                          for k in ["data", "kin", "phys", "energy", "ic", "roll", "warp", "route", "route_bacc"]}
             epoch_steps = 0
             metric_f = float("inf")
             phase1 = epoch < DATA_WARMUP_EPOCHS
@@ -831,6 +833,8 @@ def RunTrainLoop(
                 avg["roll"] = float("nan")
             if not trainer.WarpSupOn():
                 avg["warp"] = float("nan")
+            if not trainer.RouteSupOn():
+                avg["route"] = avg["route_bacc"] = float("nan")
 
             # B3: 평가·best.pt는 EMA 가중치로 — raw는 백업 후 이 구간 동안만 스왑
             do_val = epoch % t_params["val_interval"] == 0
@@ -966,6 +970,8 @@ def RunTrainLoop(
                 "RollSeamJump":      seam_jump,
                 "RollTauMaxBest":    tau_max_best,
                 "AvgLoss_Warp":      avg["warp"],
+                "AvgLoss_Route":     avg["route"],
+                "RouteBacc":         avg["route_bacc"],
             })
             WriteLog(log_path, log_rows)
             param_log.Record(epoch, step, lr)   # raw 가중치 기준 (RestoreRaw 이후)

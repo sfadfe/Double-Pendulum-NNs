@@ -320,6 +320,7 @@ class LambdaBalance:
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
         self._WarpSupTerm(acc, budget, losses)
+        self._RouteSupTerm(acc, budget, losses)
 
         if colloc_meta is not None and self.kin_ramp > 0.0:
             self._BackwardKinChunks(colloc_meta, metric_box, losses)
@@ -421,7 +422,7 @@ class LambdaBalance:
         # mean (μ_1 − s*)² over the kept windows of WarpSupDraw; cond has no grad → only the warp MLP learns
         # // μ_1을 s*에 맞춘다. 워프 MLP에만 gradient
         cond, s_star, keep = self.WarpSupDraw(n)
-        mu1 = self.time_warp(cond)[:, 1, 0]
+        mu1 = self.WarpOf(cond)[0][:, 1, 0]                        # class_split: the row's route warp // 경로 워프
         return (keep * (mu1 - s_star) ** 2).sum() / keep.sum().clamp_min(1.0)
 
     def _WarpSupTerm(self, acc, budget, losses):
@@ -440,6 +441,67 @@ class LambdaBalance:
                 l_w = self.WarpSupLoss(self.trainCfg.warp_sup_cases)
         losses["warp"] = l_w.detach()
 
+    # --- class-route router supervision (NetCfg.class_routes ≥ 3) // 경로 라우터 CE 감독 ---
+    def RouteSupOn(self):
+        return self.router is not None and self.trainCfg.route_sup_cases > 0
+
+    def CaseRotates(self):
+        # (n_case,) bool: the case's corpus path passes over the top at least once — flip by behaviour, not by the
+        #   energy gate. Cached per active source, chunked (the corpus may sit on the CPU). // 케이스가 한 번이라도 넘어가나
+        data, _ = self._ActiveSource()
+        if self.__dict__.get("_rot_src") is not data:
+            rot = []
+            for s in range(0, data.shape[0], 4096):
+                th = data[s:s + 4096, :, 1:5:2].to(self.device)
+                kk = torch.floor((th + math.pi) / (2.0 * math.pi))
+                rot.append((kk.amax(1) != kk.amin(1)).any(1))
+            self.__dict__["_rot_src"], self.__dict__["_case_rot"] = data, torch.cat(rot)
+        return self.__dict__["_case_rot"]
+
+    def RouteLabels(self, seg, cases):
+        # seg (n, m+1, 13) corpus rows over the window [t0, t0 + march_dt], cases (n,) → (n,) long: 2 = θ1 or θ2 passes
+        #   an odd multiple of π inside the window (stored θ unwrapped), 1 = other window of a case that passes over the
+        #   top somewhere (CaseRotates), 0 = NF. // 경로 라벨: 2 회전 창, 1 flip 비회전 창, 0 NF
+        kk = torch.floor((seg[:, :, 1:5:2] + math.pi) / (2.0 * math.pi))
+        cross = (kk.amax(1) != kk.amin(1)).any(1)
+        return torch.where(cross, 2, self.CaseRotates()[cases].long())
+
+    def RouteSupLoss(self, n):
+        # CE of the router on n random (case, window start) pairs of active_cases, the input detached → only the router
+        #   learns. Also the batch balanced accuracy (mean recall over the routes present) for the log.
+        # // 창 시작 n개 추첨 → 라우터 CE (+ 균형 정확도, 로그용)
+        dev = self.device
+        m = int(round(self.dataCfg.march_dt / self.dt))
+        data, _ = self._ActiveSource()
+        ac = self.active_cases
+        cases = ac[torch.randint(0, len(ac), (n,), device=dev)]
+        i0 = torch.randint(0, self.n_step - m, (n,), device=dev)
+        grid = i0.unsqueeze(1) + torch.arange(m + 1, device=dev)
+        if data.device != dev:
+            seg = data[cases.cpu().unsqueeze(1), grid.cpu()].to(dev)
+        else:
+            seg = data[cases.unsqueeze(1), grid]
+        lab = self.RouteLabels(seg, cases)
+        with torch.no_grad():
+            x = self.RouteIn(seg[:, 0, 1:5], self.param_embed(self.NormParams(self._ParamsAt(cases))))
+        logits = self.router(x)
+        k = self.class_routes
+        hit = torch.zeros(k, device=dev).index_add_(0, lab, (logits.argmax(1) == lab).float())
+        cnt = torch.zeros(k, device=dev).index_add_(0, lab, torch.ones_like(hit[lab]))
+        bacc = (hit / cnt.clamp_min(1.0)).sum() / (cnt > 0).sum().clamp_min(1)
+        return torch.nn.functional.cross_entropy(logits, lab), bacc.detach()
+
+    def _RouteSupTerm(self, acc, budget, losses):
+        # Backward + flush of the router CE (unnamed flush as _WarpSupTerm: no grad-norm slot, scale 1, fp32 MLP)
+        # // 라우터 CE backward·flush
+        if not self.RouteSupOn():
+            return
+        l_r, bacc = self.RouteSupLoss(self.trainCfg.route_sup_cases)
+        self._Backward(self.trainCfg.route_sup * l_r, None)
+        self._FlushTerm(acc, budget, None)
+        losses["route"] = l_r.detach()
+        losses["route_bacc"] = bacc
+
     def BackwardAll(self, batch, colloc_meta, ic_parts, roll_loss=None):
         # Peak VRAM: data → physics chunks → IC chunks → roll // 항목별 순차 backward
         # 반환값(metric, losses)은 0-dim GPU 텐서 — 호출자가 스텝 끝에서 1회만 float()로 읽는다.
@@ -457,6 +519,7 @@ class LambdaBalance:
         metric_box[0] = metric_box[0] + w_data.detach()
         self._FlushTerm(acc, budget, "data")
         self._WarpSupTerm(acc, budget, losses)
+        self._RouteSupTerm(acc, budget, losses)
 
         self._BackwardPhysicsChunks(colloc_meta, metric_box, losses)
         self._FlushTerm(acc, budget, "phys")   # kin+phys+energy combo 단위 // combo is what blows up
@@ -771,6 +834,7 @@ class TimeMarching:
         return self._Compiled("roll_round", self._RollRoundImpl)(state, p_emb, tau_col, rem)
 
     def _RollRoundImpl(self, state, p_emb, tau_col, rem):
+        p_emb = self.RouteRefresh(state, p_emb)                    # router nets: route of this window's start state
         last = self._RollForwardImpl(self._FeatsOf(tau_col, state, p_emb), 1)[:, -1, :]   # (n,4) [Δθ,ω]
         th_abs = state[:, 0::2] + last[:, :2]                      # 절대각 복원 (θ 열 0, 2)
         nxt = torch.stack([th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1)

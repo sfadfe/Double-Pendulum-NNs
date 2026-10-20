@@ -96,6 +96,14 @@ class NetCfg:
     # // 클래스 분리: flip 케이스는 앞단(proj_in + 블록 0..k-1)·FiLMCond·헤드가 따로, 블록 k..는 fc1 공유. 0 = 끔
     class_split: int = 0
     class_gate_center: float = -0.255
+    # K-way routes (2026-10-20, branch FiLM-MoE): class_routes routes of the class_split structure, each with its own
+    #   front, FiLMCond, heads and (warp_k > 0) time warp. 2 = flip / NF by the energy gate above. 3 = no energy gate:
+    #   route = argmax Router(window-start state, param_embed) — 0 NF, 1 flip window not passing over the top, 2 window
+    #   passing over the top (speed: rotating < NF < flip not rotating → own warps). Window-constant, recomputed per
+    #   window in every rollout; the router learns from TrainCfg.route_sup only. route_hidden = router MLP width.
+    # // K경로: 2 = 에너지 게이트 flip/NF, 3 = 라우터(창 시작 상태) NF / flip 비회전 / flip 회전 창, 경로마다 워프
+    class_routes: int = 2
+    route_hidden: int = 64
 
     @property
     def gx_dim(self) -> int:
@@ -168,6 +176,12 @@ class TrainCfg:
     class_norm: bool = False
     flip_w: float = 1.0
     class_norm_ema: float = 0.99
+    # Router supervision (NetCfg.class_routes ≥ 3): CE of the router on route_sup_cases random (case, window start)
+    #   pairs of active_cases per step, labels Trainstep.RouteLabels from the corpus path. Input detached → only the
+    #   router learns; weight route_sup, outside RebalanceGradScales. Logged as AvgLoss_Route / RouteBacc.
+    # // 라우터 CE 감독 — 라우터만 학습, 밸런서 밖
+    route_sup: float = 1.0
+    route_sup_cases: int = 4096
 
     # IC 항 스텝당 케이스 상한 (0 = 전체 active_cases) // IC는 세그먼트마다 반복되는 항이라
     #   비용이 max_cases × n_segments로 곱셈이다 (march_dt를 줄이면 조용히 커진다).
@@ -333,6 +347,7 @@ def LoadConfig(path):
         warp_k=n.get("warp_k", 0), warp_hidden=n.get("warp_hidden", 64),
         warp_beta_init=n.get("warp_beta_init", 4.0),
         class_split=n.get("class_split", 0), class_gate_center=n.get("class_gate_center", -0.255),
+        class_routes=n.get("class_routes", 2), route_hidden=n.get("route_hidden", 64),
     )
 
     train_cfg = TrainCfg(
@@ -363,6 +378,7 @@ def LoadConfig(path):
         trim_q_kin=t.get("trim_q_kin", 0.0),
         class_norm=t.get("class_norm", False), flip_w=t.get("flip_w", 1.0),
         class_norm_ema=t.get("class_norm_ema", 0.99),
+        route_sup=t.get("route_sup", 1.0), route_sup_cases=t.get("route_sup_cases", 4096),
         roll_balance_points=t.get("roll_balance_points", 12),
         ic_max_n=t.get("ic_max_n", 0),
         freeze_from=t.get("freeze_from", ""), freeze_below=t.get("freeze_below", 0),

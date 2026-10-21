@@ -111,6 +111,12 @@ class NetCfg:
     #   stem under route e's warp at route_pts τ points (AoE-style, Networks.ScaleScores; needs a ≥ 1 — block 0 reads τ
     #   only, scratch/aoe_depth_probe.log: windows separate from block 3 on). Window-constant, recomputed per window.
     # // 공유 몸통(블록 0..a-1) 뒤 경로 전용 블록. scale: 라우터 없이 expert 자기 활성 크기로 창 경로 선택
+    # route_by "gate" (2026-10-21, branch FiLM-MoE, class_routes 3, route_at ≥ 1, warp_k 0): routes 0 nf / 1 flip window
+    #   not passing over the top (pre f + post f) / 2 cross. Training rows take the true label of their window start
+    #   (Dataset.TrueRoute: energy gate, then RK4 over the window); eval rows take the energy gate, then inside flip a
+    #   binary gate MLP (route_hidden) on the stem output h_a averaged over route_pts τ points (Networks.GateLogits),
+    #   trained by TrainCfg.route_sup CE on flip windows with its gradient into the stem scaled (gate_lam_frac).
+    # // gate: 학습은 창 시작 상태의 참 라벨, 평가는 에너지 게이트 → flip 안에서 h_a 이진 게이트
     route_at: int = 0
     route_by: str = "router"
     route_pts: int = 4
@@ -193,6 +199,11 @@ class TrainCfg:
     # // 라우터 CE 감독 — 라우터만 학습, 밸런서 밖. scale이면 진단(RouteBacc·RouteLoad)용 추첨 수만
     route_sup: float = 1.0
     route_sup_cases: int = 4096
+    # route_by "gate": the gate CE draws route_sup_cases flip windows; its gradient enters the stem scaled by λ (forward
+    #   identity) with λ = min(1, gate_lam_frac · ‖data grad on the stem‖ / EMA ‖CE grad on the stem at λ = 1‖) —
+    #   the stem's CE share stays ≤ gate_lam_frac of the data term. Stem = proj_in + blocks 0..route_at-1. Logged GateLam.
+    # // gate CE의 몸통 gradient를 data 몸통 gradient의 gate_lam_frac 이하로 (λ, forward 항등)
+    gate_lam_frac: float = 0.1
 
     # IC 항 스텝당 케이스 상한 (0 = 전체 active_cases) // IC는 세그먼트마다 반복되는 항이라
     #   비용이 max_cases × n_segments로 곱셈이다 (march_dt를 줄이면 조용히 커진다).
@@ -391,6 +402,7 @@ def LoadConfig(path):
         class_norm=t.get("class_norm", False), flip_w=t.get("flip_w", 1.0),
         class_norm_ema=t.get("class_norm_ema", 0.99),
         route_sup=t.get("route_sup", 1.0), route_sup_cases=t.get("route_sup_cases", 4096),
+        gate_lam_frac=t.get("gate_lam_frac", 0.1),
         roll_balance_points=t.get("roll_balance_points", 12),
         ic_max_n=t.get("ic_max_n", 0),
         freeze_from=t.get("freeze_from", ""), freeze_below=t.get("freeze_below", 0),

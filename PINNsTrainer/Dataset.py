@@ -1,9 +1,12 @@
 import json
+import math
 import os
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from .ODE import Rk4Window
 
 class Dataset:
     def LoadData(self, path):
@@ -109,8 +112,12 @@ class Dataset:
         # // 케이스 상수 열: param_embed (+ class_split이면 클래스 게이트 열)
         p_emb = self.param_embed(self.NormParams(params_raw))
         if self.class_split > 0:   # route column: energy gate (2 routes), router (class_routes 3) or scale // 경로 열
-            gate = (self.ClassGate(ic_state, params_raw) if self.router is None and not self.route_scale
-                    else self.RouteOf(ic_state, p_emb, Dedupe=True))
+            if self.route_gate:    # gate nets: true label in training, gate in eval // 학습 = 참 라벨, 평가 = 게이트
+                gate = (self.TrueRoute(ic_state, params_raw) if self.training
+                        else self.GateRoute(ic_state, params_raw, p_emb, Dedupe=True))
+            else:
+                gate = (self.ClassGate(ic_state, params_raw) if self.router is None and not self.route_scale
+                        else self.RouteOf(ic_state, p_emb, Dedupe=True))
             p_emb = torch.cat([p_emb, gate.to(p_emb.dtype)], dim=1)
         return p_emb
 
@@ -133,12 +140,53 @@ class Dataset:
             return self.ScaleScores(u).argmax(dim=1, keepdim=True).float()[inv]
         return self.ScaleScores(x).argmax(dim=1, keepdim=True).float()
 
-    def RouteRefresh(self, state, p_emb):
-        # roll pushforward: the route column from the current window-start state (router / scale nets; the energy gate is
-        #   conserved, so 2-route nets keep the k0 column) // 라운드마다 경로 열 갱신
+    def RouteRefresh(self, state, p_emb, params_raw=None):
+        # roll pushforward: the route column from the current window-start state (router / scale / gate nets; the energy
+        #   gate is conserved, so 2-route nets keep the k0 column). params_raw: gate nets only. // 라운드마다 경로 열 갱신
+        if self.route_gate:
+            r = (self.TrueRoute(state, params_raw) if self.training
+                 else self.GateRoute(state, params_raw, p_emb[:, :-1]))
+            return torch.cat([p_emb[:, :-1], r.to(p_emb.dtype)], dim=1)
         if self.router is None and not self.route_scale:
             return p_emb
         return torch.cat([p_emb[:, :-1], self.RouteOf(state, p_emb[:, :-1])], dim=1)
+
+    @torch.no_grad()
+    def TrueRoute(self, ic_state, params_raw):
+        # route_by "gate", training: (N, 1) true route of the window starting at ic_state — 0 nf (ClassGate), 2 the true
+        #   path over the window passes an odd multiple of π (θ1 or θ2, RK4 at the corpus dt, the RouteLabels rule), 1 other
+        #   flip window. A function of the start state, so it holds for perturbed colloc ICs and marched roll states too.
+        #   Compiled with a dynamic row count (one graph for every call site); inlined inside compiled graphs.
+        # // 창 시작 상태의 참 경로: 에너지 게이트 → 창 동안 RK4 경로가 꼭대기를 넘으면 2, 아니면 1
+        if torch.compiler.is_compiling() or not self.trainCfg.use_compile:
+            return self._TrueRouteImpl(ic_state, params_raw)
+        fn = self.__dict__.get("_true_route_fn")
+        if fn is None:
+            fn = self.__dict__["_true_route_fn"] = torch.compile(self._TrueRouteImpl, dynamic=True)
+        return fn(ic_state, params_raw)
+
+    def _TrueRouteImpl(self, ic_state, params_raw):
+        m = int(round(self.march_dt / self.dt))
+        x = ic_state.float()
+        path = Rk4Window(self.ODE, x, params_raw.float(), [self.dt * k for k in range(1, m + 1)], self.dt)
+        th = torch.cat([x[:, None, 0::2], path[:, :, 0::2]], dim=1)             # (N, m+1, 2) θ1, θ2
+        kk = torch.floor((th + math.pi) / (2.0 * math.pi))
+        cross = (kk.amax(1) != kk.amin(1)).any(1, keepdim=True)
+        flip = self.ClassGate(ic_state, params_raw) > 0.5
+        return torch.where(flip, 1.0 + cross.float(), torch.zeros_like(flip, dtype=torch.float))
+
+    @torch.no_grad()
+    def GateRoute(self, ic_state, params_raw, p_emb, Dedupe=False):
+        # route_by "gate", eval: (N, 1) route — 0 nf by ClassGate, else 1 + argmax GateLogits (1 pre f / post f, 2 cross).
+        #   Dedupe: each distinct window once (eager callers only, as RouteOf). // 에너지 게이트 → flip 안 이진 게이트
+        x = self.RouteIn(ic_state, p_emb)
+        if Dedupe:
+            u, inv = torch.unique(x, dim=0, return_inverse=True)
+            cross = (self.GateLogits(u).argmax(dim=1, keepdim=True) == 1)[inv]
+        else:
+            cross = self.GateLogits(x).argmax(dim=1, keepdim=True) == 1
+        flip = self.ClassGate(ic_state, params_raw) > 0.5
+        return torch.where(flip, 1.0 + cross.float(), torch.zeros_like(flip, dtype=torch.float))
 
     @torch.no_grad()
     def ClassGate(self, ic_state, params_raw):

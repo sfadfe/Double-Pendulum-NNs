@@ -34,6 +34,8 @@ CSV_HEADER = [
     #   route_by "scale": no CE — RouteBacc = balanced accuracy of the best route → label map, RouteLoad = largest
     #   route share (1 = one expert takes every window) // scale: 라벨 대비 Bayes 균형 정확도, 최대 경로 몫
     "AvgLoss_Route", "RouteBacc", "RouteLoad",
+    # route_by "gate": epoch mean of λ, the gate CE's gradient scale into the stem (TrainCfg.gate_lam_frac) // 게이트 λ
+    "GateLam",
 ]
 
 
@@ -649,7 +651,7 @@ def RunTrainLoop(
         for epoch in pbar:
             epoch_sums = {k: torch.tensor(0.0, device=device)
                           for k in ["data", "kin", "phys", "energy", "ic", "roll", "warp", "route", "route_bacc",
-                                    "route_load"]}
+                                    "route_load", "gate_lam"]}
             epoch_steps = 0
             metric_f = float("inf")
             phase1 = epoch < DATA_WARMUP_EPOCHS
@@ -847,6 +849,8 @@ def RunTrainLoop(
                 avg["route_bacc"] = float("nan")
             if not trainer.route_scale:
                 avg["route_load"] = float("nan")
+            if not (trainer.route_gate and trainer.RouteSupOn()):
+                avg["gate_lam"] = float("nan")
 
             # B3: 평가·best.pt는 EMA 가중치로 — raw는 백업 후 이 구간 동안만 스왑
             do_val = epoch % t_params["val_interval"] == 0
@@ -993,6 +997,7 @@ def RunTrainLoop(
                 "AvgLoss_Route":     avg["route"],
                 "RouteBacc":         avg["route_bacc"],
                 "RouteLoad":         avg["route_load"],
+                "GateLam":           avg["gate_lam"],
             })
             WriteLog(log_path, log_rows)
             param_log.Record(epoch, step, lr)   # raw 가중치 기준 (RestoreRaw 이후)

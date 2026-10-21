@@ -358,9 +358,11 @@ class Networks(nn.Module):
         #   same modules in the same order as before. // 공유 몸통 a블록, 경로 전용 블록 a..a+k-1. a = 0이면 종전과 동일
         self.route_at = netCfg.route_at if self.class_split > 0 else 0
         self.route_scale = self.class_split > 0 and netCfg.route_by == "scale"
+        # route_by "gate": label routes in training, energy gate + h_a gate in eval (config.py) // 게이트 경로
+        self.route_gate = self.class_split > 0 and netCfg.route_by == "gate"
         self.route_pts = netCfg.route_pts
         self.n_stem_slots = 0
-        self.routes_x = self.warps_x = self.router = None
+        self.routes_x = self.warps_x = self.router = self.gate = None
         if self.class_split > 0:
             a, k_own = self.route_at, self.class_split
             if (self.n_tok > 0 or self.stage_at or self.film_split_at > 0
@@ -368,10 +370,12 @@ class Networks(nn.Module):
                     or any(t not in ("film", "ffn") for t in self.block_types)):
                 raise ValueError("class_split: plain film/ffn nets only (no stage/xattn/film_split/stream_act), "
                                  f"1 ≤ k ≤ n_blocks − route_at, got k {k_own}, route_at {a}")
-            if netCfg.route_by not in ("router", "scale"):
-                raise ValueError(f"route_by must be 'router' or 'scale', got {netCfg.route_by!r}")
+            if netCfg.route_by not in ("router", "scale", "gate"):
+                raise ValueError(f"route_by must be 'router', 'scale' or 'gate', got {netCfg.route_by!r}")
             if self.route_scale and (self.class_routes < 2 or a < 1 or self.route_pts < 1):
                 raise ValueError("route_by 'scale': class_routes ≥ 2, route_at ≥ 1 (block 0 reads τ only), route_pts ≥ 1")
+            if self.route_gate and (self.class_routes != 3 or a < 1 or self.route_pts < 1 or self.time_warp is not None):
+                raise ValueError("route_by 'gate': class_routes 3, route_at ≥ 1, route_pts ≥ 1, warp_k 0")
             if not self.route_scale and self.class_routes not in (2, 3):
                 raise ValueError(f"class_routes must be 2 (energy gate) or 3 (router), got {self.class_routes}")
             self.n_stem_slots = sum(1 for t in self.block_types[:a] if t in ("film", "xattn"))
@@ -393,9 +397,12 @@ class Networks(nn.Module):
                     "head_theta": nn.Linear(width, 2),
                     "head_omega": nn.Linear(width, 2),
                 }) for _ in range(self.class_routes - 2)])
-                if not self.route_scale:
+                if netCfg.route_by == "router":
                     self.router = nn.Sequential(nn.Linear(netCfg.cond_dim, netCfg.route_hidden), nn.SiLU(),
                                                 nn.Linear(netCfg.route_hidden, self.class_routes))
+                elif self.route_gate:   # h_a (width) → logits [route 1, route 2] // 몸통 출력 → flip 안 이진 게이트
+                    self.gate = nn.Sequential(nn.Linear(width, netCfg.route_hidden), nn.SiLU(),
+                                              nn.Linear(netCfg.route_hidden, 2))
             if self.time_warp is not None:
                 self.warps_x = nn.ModuleList([
                     TimeWarp(netCfg.cond_dim, netCfg.warp_hidden, netCfg.warp_k, netCfg.warp_beta_init)
@@ -467,6 +474,9 @@ class Networks(nn.Module):
         if self.router is not None:
             nn.init.zeros_(self.router[-1].weight)
             nn.init.zeros_(self.router[-1].bias)
+        if self.gate is not None:   # equal logits → no CE gradient into the stem at init // 시작 시 몸통 CE gradient 0
+            nn.init.zeros_(self.gate[-1].weight)
+            nn.init.zeros_(self.gate[-1].bias)
 
     def SetHalf(self, mode):
         # fp16 GEMMs (TrainCfg.half_gemm): "off" | "blk" (block branch fc1) | "blk+film" (+ FiLM last layer)
@@ -548,6 +558,23 @@ class Networks(nn.Module):
             blk = self.blocks[a] if e == 0 else self.RouteMods(e)[1][0]
             out.append(blk.act(blk.Fc1(h)).pow(2).sum(-1).view(n, p).sum(1))
         return torch.stack(out, dim=1)
+
+    def GateLogits(self, c, lam=None):
+        # route_by "gate": c (n, cond_dim) window cond inputs → (n, 2) logits [route 1, route 2] of the gate MLP on the
+        #   stem output h_a (shared FiLM slots) averaged over τ_j = (j + ½)·march_dt/route_pts — window-constant.
+        #   lam (0-dim tensor): the CE gradient into the stem is scaled by lam, forward identity (TrainCfg.gate_lam_frac).
+        # // 몸통 출력 h_a의 τ 평균 → 이진 게이트. lam = 몸통으로 가는 gradient 배율 (forward 항등)
+        n, p, a = c.shape[0], self.route_pts, self.route_at
+        tau = ((torch.arange(p, device=c.device, dtype=c.dtype) + 0.5) * (self.march_dt / p)).repeat(n).unsqueeze(1)
+        gamma, beta = self.film(c)                     # one row per window, broadcast over its p rows (FiLMBlock)
+        gammas, betas = gamma.unbind(1), beta.unbind(1)
+        h = self.proj_in(torch.cat([self.fourier(tau), 2.0 * tau / self.march_dt - 1.0], dim=-1))
+        for i in range(a):
+            h = self.ApplyBlock(i, h, gammas, betas)
+        hm = h.view(n, p, -1).mean(1)
+        if lam is not None:
+            hm = hm.detach() + lam * (hm - hm.detach())
+        return self.gate(hm)
 
     def _TokenFeats(self, feats_case, cond_case):
         # (n, F) case rows → token rows (n, P, F) at τ = tau_tok with the case columns copied; cond likewise

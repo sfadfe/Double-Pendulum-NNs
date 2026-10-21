@@ -284,7 +284,7 @@ class Loss:
             p_emb = self.CaseEmb(params, state)                    # route from the true IC at k0, refreshed per round
             rem = depth_c.unsqueeze(1)                             # (n,1) 남은 라운드 — ≤ 0이면 고정
             for _ in range(max_depth):
-                state, rem = self._RollRound(state, p_emb, tau_col, rem)
+                state, rem = self._RollRound(state, p_emb, tau_col, rem, params)
         state = state.detach()
 
         kg_c = k0_c + depth_c

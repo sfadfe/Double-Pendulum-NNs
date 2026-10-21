@@ -176,8 +176,10 @@ class LambdaBalance:
         s = self._BwScale(name)
         (loss if s == 1.0 else loss * s).backward(retain_graph=False)
 
-    def _FlushTerm(self, acc, budget, name=None):
+    def _FlushTerm(self, acc, budget, name=None, Stem=False):
         # 직전 항의 .grad(청크 누적 완료분)를 clip → acc로 이관 → .grad 비움
+        # gate nets (route_by "gate"): the data term and Stem=True (gate CE) record their stem gradient norm
+        #   (pre-clip, applied) in _stem_gn for the λ of _GateSupTerm // 게이트 넷: 몸통 gradient 노름 기록
         # clip_grad_norm_의 반환값 = clip 이전 노름 (공짜) — 항별 포화 여부 진단용 EMA로 축적.
         # rebalance(10에폭)를 기다리지 않고 매 스텝 실제 유효 크기를 볼 수 있다. // saturation probe
         # GPU 텐서로 유지 — float()를 걸면 항마다 host sync가 생긴다 (읽는 쪽에서 1회 변환).
@@ -185,7 +187,15 @@ class LambdaBalance:
         #   (S = 1 leaves every operation as it was). // S배 된 grad를 S배 예산으로 clip, 1/S로 누적
         s = self._BwScale(name)
         AverageGrads(self.parameters())   # multi-GPU: clip the full batch's gradient, not a rank's (Dist) // rank 평균 후 clip
+        stem = self.route_gate and (Stem or name == "data")
+        if stem:
+            sg = [p.grad for p in self._StemParams() if p.grad is not None]
+            g_stem = (torch.linalg.vector_norm(torch.stack(torch._foreach_norm(sg))) if sg
+                      else torch.zeros((), device=self.device)) / s
         pre = torch.nn.utils.clip_grad_norm_(self.parameters(), budget * s).detach()
+        if stem:   # clip_grad_norm_'s own factor → the stem norm that is applied // 실제 적용분
+            self.__dict__.setdefault("_stem_gn", {})["gate" if Stem else name] = (
+                g_stem, g_stem * (budget * s / (pre + 1e-6)).clamp(max=1.0))
         if s != 1.0:
             pre = pre / s
         if name is not None:
@@ -452,11 +462,12 @@ class LambdaBalance:
 
     # --- class-route router supervision (NetCfg.class_routes ≥ 3) // 경로 라우터 CE 감독 ---
     def RouteSupOn(self):
-        return self.router is not None and self.trainCfg.route_sup_cases > 0
+        return (self.router is not None or self.route_gate) and self.trainCfg.route_sup_cases > 0
 
     def RouteStatOn(self):
-        # RouteBacc / RouteLoad logged: router nets (with the CE) and scale-routed nets (diagnostics only) // 경로 진단 로그
-        return (self.router is not None or self.route_scale) and self.trainCfg.route_sup_cases > 0
+        # RouteBacc / RouteLoad logged: router / gate nets (with the CE) and scale-routed nets (diagnostics only)
+        # // 경로 진단 로그
+        return (self.router is not None or self.route_scale or self.route_gate) and self.trainCfg.route_sup_cases > 0
 
     def CaseRotates(self):
         # (n_case,) bool: the case's corpus path passes over the top at least once — flip by behaviour, not by the
@@ -525,9 +536,71 @@ class LambdaBalance:
         bacc = (cnt / tot.clamp_min(1.0).unsqueeze(1)).amax(0).sum() / (tot > 0).sum().clamp_min(1)
         return bacc, cnt.sum(0).amax() / len(pred)
 
+    # --- route_by "gate": binary gate CE on flip windows, gradient into the stem scaled by λ // 게이트 CE 감독 ---
+    def _StemParams(self):
+        # proj_in + blocks 0..route_at-1: where the λ budget is measured (TrainCfg.gate_lam_frac) // λ 예산을 재는 몸통
+        if self.__dict__.get("_stem_params") is None:
+            self.__dict__["_stem_params"] = [p for m in (self.proj_in, *self.blocks[:self.route_at])
+                                             for p in m.parameters() if p.requires_grad]
+        return self.__dict__["_stem_params"]
+
+    def _GateDraw(self, n):
+        # n random (flip case, window start) pairs of active_cases → (labels (n,) long: 1 = the corpus path passes an odd
+        #   multiple of π in the window, cond inputs (n, cond_dim), param_embed with grad) // flip 창 n개 → cross 라벨, 게이트 입력
+        dev = self.device
+        m = int(round(self.dataCfg.march_dt / self.dt))
+        data, _ = self._ActiveSource()
+        ac = self.active_cases
+        if self.__dict__.get("_gate_src") is not ac:       # flip rows of active_cases, once per active set // 1회 캐시
+            self.__dict__["_gate_src"], self.__dict__["_gate_pool"] = ac, ac[self.is_flip[ac]]
+        pool = self.__dict__["_gate_pool"]
+        cases = pool[torch.randint(0, len(pool), (n,), device=dev)]
+        i0 = torch.randint(0, self.n_step - m, (n,), device=dev)
+        grid = i0.unsqueeze(1) + torch.arange(m + 1, device=dev)
+        if data.device != dev:
+            seg = data[cases.cpu().unsqueeze(1), grid.cpu()].to(dev)
+        else:
+            seg = data[cases.unsqueeze(1), grid]
+        kk = torch.floor((seg[:, :, 1:5:2] + math.pi) / (2.0 * math.pi))
+        lab = (kk.amax(1) != kk.amin(1)).any(1).long()
+        x = self.RouteIn(seg[:, 0, 1:5], self.param_embed(self.NormParams(self._ParamsAt(cases))))
+        return lab, x
+
+    def GateSupLoss(self, n, lam):
+        # CE of the gate on n flip windows (stem gradient × lam) + balanced accuracy over the two labels, for the log
+        # // flip 창 n개 게이트 CE (+ 균형 정확도)
+        lab, x = self._GateDraw(n)
+        logits = self.GateLogits(x, lam)
+        hit = torch.zeros(2, device=self.device).index_add_(0, lab, (logits.argmax(1) == lab).float())
+        cnt = torch.zeros(2, device=self.device).index_add_(0, lab, torch.ones_like(hit[lab]))
+        bacc = (hit / cnt.clamp_min(1.0)).sum() / (cnt > 0).sum().clamp_min(1)
+        return torch.nn.functional.cross_entropy(logits, lab), bacc.detach()
+
+    def _GateSupTerm(self, acc, budget, losses):
+        # λ = min(1, gate_lam_frac · applied data stem norm (this step) / EMA of the λ-free CE stem norm), then backward +
+        #   flush of the CE (unnamed, scale 1); the EMA takes this step's CE stem norm / λ. GPU tensors only, no host sync.
+        #   At init the gate's last layer is 0 → CE stem norm 0 → λ = 1. // λ = data 몸통 노름 대비 비율 상한, sync 없음
+        gd = self.__dict__.get("_stem_gn", {}).get("data")
+        gc = self.__dict__.get("_gate_gc")
+        one = torch.ones((), device=self.device)
+        lam = one if gd is None or gc is None else (
+            self.trainCfg.gate_lam_frac * gd[1] / gc.clamp_min(1e-30)).clamp(1e-6, 1.0)
+        l_r, bacc = self.GateSupLoss(self.trainCfg.route_sup_cases, lam)
+        self._Backward(self.trainCfg.route_sup * l_r, None)
+        self._FlushTerm(acc, budget, None, Stem=True)
+        ghat = self._stem_gn["gate"][0] / lam
+        nxt = ghat if gc is None else 0.9 * gc + 0.1 * ghat
+        self.__dict__["_gate_gc"] = torch.where(torch.isfinite(nxt), nxt, gc if gc is not None else torch.zeros_like(ghat))
+        losses["route"] = l_r.detach()
+        losses["route_bacc"] = bacc
+        losses["gate_lam"] = lam
+
     def _RouteSupTerm(self, acc, budget, losses):
         # Backward + flush of the router CE (unnamed flush as _WarpSupTerm: no grad-norm slot, scale 1, fp32 MLP)
         # // 라우터 CE backward·flush
+        if self.route_gate and self.RouteSupOn():
+            self._GateSupTerm(acc, budget, losses)
+            return
         if self.route_scale and self.RouteStatOn():   # scale routes: diagnostics only, no backward // 진단만
             losses["route_bacc"], losses["route_load"] = self.RouteScaleStats(self.trainCfg.route_sup_cases)
             return
@@ -862,16 +935,16 @@ class TimeMarching:
             cond = tuple(c.repeat_interleave(n_points, dim=0) for c in cond)
         return self(feats, cond=cond, n_q=n_points).reshape(n, n_points, 4)
 
-    def _RollRound(self, state, p_emb, tau_col, rem):
+    def _RollRound(self, state, p_emb, tau_col, rem, params):
         # One pushforward round of _RolloutMergedDraws as one compiled graph: feats → window end → hand-off, and
         # cases with no rounds left (rem ≤ 0) stay frozen. p_emb (n,E) / tau_col (n,1) are case-constant, built once per step.
         # Eager feats + compiled forward + eager hand-off was 0.39 ms per round, launch-bound (64 and 256 cases take
         # the same time); fused 0.18 ms, same bits (film 256×6, R9700, 2026-10-15).
         # // 라운드 하나를 compile 1개로 — 수학 동일, 런치 수만 줄인다. state (n,4) [θ1,ω1,θ2,ω2], rem (n,1) 남은 라운드
-        return self._Compiled("roll_round", self._RollRoundImpl)(state, p_emb, tau_col, rem)
+        return self._Compiled("roll_round", self._RollRoundImpl)(state, p_emb, tau_col, rem, params)
 
-    def _RollRoundImpl(self, state, p_emb, tau_col, rem):
-        p_emb = self.RouteRefresh(state, p_emb)                    # router nets: route of this window's start state
+    def _RollRoundImpl(self, state, p_emb, tau_col, rem, params):
+        p_emb = self.RouteRefresh(state, p_emb, params)            # router / gate nets: route of this window's start state
         last = self._RollForwardImpl(self._FeatsOf(tau_col, state, p_emb), 1)[:, -1, :]   # (n,4) [Δθ,ω]
         th_abs = state[:, 0::2] + last[:, :2]                      # 절대각 복원 (θ 열 0, 2)
         nxt = torch.stack([th_abs[:, 0], last[:, 2], th_abs[:, 1], last[:, 3]], dim=1)

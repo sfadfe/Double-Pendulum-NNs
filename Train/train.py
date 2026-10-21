@@ -2,6 +2,7 @@
 
 
 import argparse
+import os
 import shutil
 from pathlib import Path
 import sys  
@@ -11,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 from tqdm import tqdm
 
-from PINNsTrainer import LoadConfig, OdeScheduler, PINNTrainer
+from PINNsTrainer import Dist, LoadConfig, OdeScheduler, PINNTrainer
 from Train.loop_common import (
     AppendResumeLog,
     InitCkptDir,
@@ -27,6 +28,7 @@ def Train(MainFolderPath, cfg_path=None):
     if cfg_path is None:   # default unchanged; sweeps pass their own // 스윕용 config 분리
         cfg_path = Path(__file__).parent / "config.toml"
     net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
+    Dist.ShardConfig(train_cfg, colloc_cfg, data_cfg, t_params)   # multi-GPU: per-rank sample counts // rank별 표본
 
     # Fixed seed for fresh pretrain: every RNG in the pipeline is torch (init, batch draws,
     #   colloc, roll k0/depth), and manual_seed covers CUDA too.
@@ -34,13 +36,14 @@ def Train(MainFolderPath, cfg_path=None):
     # [train] seed (default 42) for seed repeats of an arm // 시드 반복용, 기본 42 = 종전
     torch.manual_seed(int(t_params.get("seed", 42)))
 
-    shutil.copy(cfg_path, MainFolderPath / "config.toml")
+    if Dist.IsMain():
+        shutil.copy(cfg_path, MainFolderPath / "config.toml")
 
     torch.set_float32_matmul_precision(train_cfg.matmul_precision)
     device = "cuda" if torch.cuda.is_available() else "cpu"     
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
-    trainer.Setup(base_dir, MainFolderPath)
+    trainer.Setup(base_dir, Dist.ScalerDir(MainFolderPath))
     SetupCaseSplit(trainer, t_params)
     if train_cfg.freeze_from:   # 예측 구간 동결 스크린: 블록 1..k·FiLM(A)·stage head 0 로드 후 동결
         fz_path = base_dir / train_cfg.freeze_from
@@ -51,6 +54,7 @@ def Train(MainFolderPath, cfg_path=None):
         trainer._ResetEMA()
         tqdm.write(f"[freeze] {fz_path}: prediction region (blocks 1..{train_cfg.freeze_below}) frozen")
 
+    Dist.SeedRank(t_params.get("seed", 42), 0)
     RunTrainLoop(
         trainer, device, train_cfg, data_cfg, t_params,
         start_epoch=0, step=0, val_best=float("inf"), rollout_best=float("inf"),
@@ -69,12 +73,13 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     ckpt_dir = ckpt_path.parent
     cfg_path = ckpt_dir / "config.toml"
     net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
+    Dist.ShardConfig(train_cfg, colloc_cfg, data_cfg, t_params)
 
     torch.set_float32_matmul_precision(train_cfg.matmul_precision)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = PINNTrainer(net_cfg, train_cfg, colloc_cfg, data_cfg, device)
-    trainer.Setup(base_dir, ckpt_dir)
+    trainer.Setup(base_dir, Dist.ScalerDir(ckpt_dir))
     SetupCaseSplit(trainer, t_params)
     if train_cfg.freeze_from:   # resume: 동결 플래그만 재적용 (가중치는 latest.pt) — optimizer 그룹 크기 일치
         trainer.FreezeBelowStage(None)
@@ -91,7 +96,8 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
 
     steps_per_epoch = len(trainer.segments) * t_params["steps_per_segment"]
     start_epoch = start_step // steps_per_epoch
-    AppendResumeLog(cfg_path, start_epoch, start_step, ckpt_name, changes)
+    if Dist.IsMain():
+        AppendResumeLog(cfg_path, start_epoch, start_step, ckpt_name, changes)
 
     log_path = ckpt_dir / "log.csv"
     val_best, rollout_best, extrap_best, ode_best = ReadLogBests(
@@ -111,6 +117,7 @@ def Resume(ckpt_path, new_lr=None, ckpt_name="latest"):
     )
 
     prior_rows = [r for r in ReadLogRows(log_path) if int(r["Epoch"]) < start_epoch]
+    Dist.SeedRank(t_params.get("seed", 42), start_epoch)
     RunTrainLoop(
         trainer, device, train_cfg, data_cfg, t_params,
         start_epoch=start_epoch, step=start_step, val_best=val_best, rollout_best=rollout_best,
@@ -134,6 +141,11 @@ if __name__ == "__main__":
                         help="fresh 런 config 경로 (기본 Train/config.toml). resume에는 무시 — 런 폴더의 config 사용")
     args = parser.parse_args()
 
+    # torchrun --nproc_per_node W: data parallel over W GPUs (PINNsTrainer/Dist.py); rank ≠ 0 prints nothing
+    # // torchrun이면 W개 GPU 데이터 병렬, rank 0만 출력
+    if Dist.InitDist() > 1 and not Dist.IsMain():
+        sys.stdout = open(os.devnull, "w")
+
     if args.resume:
         ckpt_path = Path(args.resume) / _CKPT_FILES[args.ckpt]
         Resume(ckpt_path, new_lr=args.lr, ckpt_name=args.ckpt)
@@ -141,5 +153,6 @@ if __name__ == "__main__":
         cfg_path = Path(args.config) if args.config else Path(__file__).parent / "config.toml"
         net_cfg, train_cfg, colloc_cfg, data_cfg, t_params, ode_s_params = LoadConfig(cfg_path)
         run_name = t_params.get("name", "")
-        MainFolderPath = InitCkptDir(suffix=run_name)
+        MainFolderPath = Dist.BroadcastObject(InitCkptDir(suffix=run_name) if Dist.IsMain() else None)
         Train(MainFolderPath, cfg_path=cfg_path)
+    Dist.Shutdown()

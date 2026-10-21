@@ -161,8 +161,11 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
     def SetOptimizerAdamW(self):
         c = self.trainCfg
         params = [p for p in self.parameters() if p.requires_grad]  # freeze_from 동결 존중
+        # foreach=True: step() is the same foreach path that None picks on GPU; the explicit flag also makes
+        #   zero_grad(set_to_none=False) one _foreach_zero_ instead of a per-param zero_ loop (_FlushTerm, 3×/step)
+        # // 명시하면 zero_grad도 다중 텐서 커널
         self.optimizer = torch.optim.AdamW(
-            params, lr=c.lr, weight_decay=c.weight_decay
+            params, lr=c.lr, weight_decay=c.weight_decay, foreach=True
         )
 
     def FreezeBelowStage(self, state=None, src_cfg_path=None):
@@ -255,14 +258,18 @@ class PINNTrainer(Networks, Physics, Dataset, Loss, LambdaBalance, TimeMarching)
         if self._ema_skip is None:
             self._ema_skip = {k for k, p in self.named_parameters() if not p.requires_grad}
         d = self.ema_decay
+        fs, fv = [], []
         for k, v in self.state_dict().items():
             if k in self._ema_skip:
                 continue
             s = self.ema_state[k]
             if torch.is_floating_point(v):
-                s.mul_(d).add_(v.detach(), alpha=1.0 - d)  # 상수 버퍼는 EMA해도 불변
+                fs.append(s); fv.append(v.detach())   # 상수 버퍼는 EMA해도 불변
             else:
                 s.copy_(v)
+        if fs:   # same mul_ then add_ per tensor, as multi-tensor kernels // 같은 연산, 다중 텐서 커널
+            torch._foreach_mul_(fs, d)
+            torch._foreach_add_(fs, fv, alpha=1.0 - d)
 
     def ApplyEMA(self):
         # 평가용: raw 백업 후 EMA 가중치 로드 // returns True if applied

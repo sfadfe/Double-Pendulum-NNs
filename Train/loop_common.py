@@ -10,6 +10,7 @@ import torch
 from tqdm import tqdm
 
 import state.Double_pendulum as Dp
+from PINNsTrainer.Dist import AllReduceMean_, BroadcastFloats, CheckSync, IsMain, StepVote, World
 
 CSV_HEADER = [
     "Epoch", "LR",
@@ -641,7 +642,8 @@ def RunTrainLoop(
 
     param_log = ParamDeltaLog(trainer, ckpt_dir, start_epoch)   # 레이어별 파라미터 변화량 // param_delta.csv
 
-    pbar = tqdm(range(start_epoch, t_params["max_epochs"]), desc="Training", dynamic_ncols=True)
+    pbar = tqdm(range(start_epoch, t_params["max_epochs"]), desc="Training", dynamic_ncols=True,
+                disable=not IsMain())
 
     try:
         for epoch in pbar:
@@ -796,9 +798,11 @@ def RunTrainLoop(
                     gnorm = torch.nn.utils.clip_grad_norm_(trainer.parameters(), train_cfg.grad_clip)
                     # 스텝당 host sync는 여기 1회뿐 — 손실·grad 두 판정값을 한 텐서로 묶어 sync를 늘리지
                     # 않는다. 항·청크별 float()는 Trainstep에서 제거됨.
-                    metric_f, gnorm_f = torch.stack(
-                        [metric_t.detach().float(), gnorm.detach().float()]
-                    ).tolist()
+                    # multi-GPU: the same vote also averages the metric and carries a SIGINT on any rank
+                    # // 다중 GPU: 같은 sync에서 rank 평균 + 종료 요청 공유
+                    metric_f, gnorm_f, stop = StepVote(metric_t, gnorm)
+                    if stop:
+                        raise KeyboardInterrupt
                     if not (math.isfinite(metric_f) and math.isfinite(gnorm_f)):
                         trainer.optimizer.zero_grad()
                         nan_keys = [k for k, v in losses.items() if not math.isfinite(float(v))]
@@ -827,6 +831,7 @@ def RunTrainLoop(
             lam = trainer.LambdaAt()
             lr = trainer.optimizer.param_groups[0]["lr"]
             metric = metric_f
+            AllReduceMean_(list(epoch_sums.values()))   # multi-GPU: losses over all ranks' rows // rank 평균
             avg = {k: float(epoch_sums[k]) / epoch_steps if epoch_steps > 0 else float("nan")
                    for k in epoch_sums}
             if phase1:
@@ -847,17 +852,20 @@ def RunTrainLoop(
             do_val = epoch % t_params["val_interval"] == 0
             do_ext = extrap_gt is not None and epoch % EXTRAP_SCHED_INTERVAL == 0
             do_roll = epoch % t_params["rollout_interval"] == 0
-            ema_applied = trainer.ApplyEMA() if (do_val or do_ext or do_roll) else False
+            if do_val:
+                CheckSync(trainer, f"epoch {epoch}")   # multi-GPU: ranks must hold the same weights // 가중치 일치 확인
+            ev = IsMain()   # multi-GPU: rank 0 evaluates, the scheduler reads its values (broadcast below) // 평가는 rank 0
+            ema_applied = trainer.ApplyEMA() if ev and (do_val or do_ext or do_roll) else False
 
             val_loss = float("nan")
             val_omega_loss = float("nan")
             val_metric = float("nan")
             val_res = None
-            if do_val:
+            if do_val and ev:
                 trainer._replay_active = False
                 trainer.active_cases = trainer.val_cases
                 with EvalPrecision():   # 평가만 순수 FP32 // TF32 반올림이 목표 1e-3과 동급이라
-                    val_res = ComputeVal(trainer, device, data_cfg.batch_size)
+                    val_res = ComputeVal(trainer, device, data_cfg.batch_size * World())   # whole eval batch // 평가 배치는 원래 크기
                 val_loss, val_omega_loss = val_res["all"]
                 # 모델 선택 지표 = θ+ω (핸드오프를 지배하는 ω 오차 포함) // best.pt selection
                 val_metric = val_loss + val_omega_loss
@@ -873,7 +881,7 @@ def RunTrainLoop(
             # Extrap: 스케줄러 veto용 독립 주기 (rollout_interval과 분리) // decoupled from rollout
             extrap_loss = float("nan")
             extrap_omega_loss = float("nan")
-            if do_ext:
+            if do_ext and ev:
                 trainer._replay_active = False
                 with EvalPrecision():
                     extrap_loss, extrap_omega_loss = ComputeExtrap(trainer, extrap_cases, extrap_gt)
@@ -891,7 +899,7 @@ def RunTrainLoop(
             rollout_omega_loss = float("nan")
             roll_res = None
             tau_max = tau_argmax = seam_jump = float("nan")
-            if do_roll:
+            if do_roll and ev:
                 trainer._replay_active = False
                 with EvalPrecision():
                     roll_res = ComputeRollout(trainer, device, case_idx=roll_eval_cases)
@@ -927,6 +935,9 @@ def RunTrainLoop(
                         f" ω={roll_res['nf'][1]:.3e}"
                     )
 
+            if World() > 1 and (do_val or do_ext or do_roll):
+                val_metric, extrap_loss, rollout_loss = BroadcastFloats([val_metric, extrap_loss, rollout_loss])
+
             # OdeScheduler: patience 타이머 + Val/Extrap/Rollout veto // 하나라도 개선 중이면 LR decay 보류
             # rollout 계산 뒤에 둔다 — 1순위 지표를 veto에 넣으려면 값이 먼저 있어야 함
             if sched_on:
@@ -939,6 +950,8 @@ def RunTrainLoop(
             # EMA 구간 종료 — 학습·latest.pt는 raw 가중치로 복원 // best.pt는 아래에서 ema_state 명시 저장
             if ema_applied:
                 trainer.RestoreRaw()
+            if not ev:   # rank 0 alone logs and saves // 로그·저장은 rank 0만
+                continue
 
             log_rows.append({
                 "Epoch":          epoch,
@@ -1016,5 +1029,6 @@ def RunTrainLoop(
 
     except KeyboardInterrupt:
         # latest만 저장 — 학습 total loss(metric)와 val 지표는 단위가 달라 best.pt를 덮으면 안 됨 // unit-mismatch guard
-        trainer.SaveLatest(ckpt_dir, step, metric, ode_sched.StateDict())
-        tqdm.write(f"저장 완료 (latest): {ckpt_dir}")
+        if IsMain():
+            trainer.SaveLatest(ckpt_dir, step, metric, ode_sched.StateDict())
+            tqdm.write(f"저장 완료 (latest): {ckpt_dir}")

@@ -1,6 +1,8 @@
 import torch
 import math
 
+from .Dist import AverageGrads
+
 
 class LambdaBalance:
     
@@ -114,8 +116,7 @@ class LambdaBalance:
         if getattr(self, "_grad_acc", None) is None:
             self._grad_acc = [torch.zeros_like(p) for p in self.parameters()]
         else:
-            for a in self._grad_acc:
-                a.zero_()
+            torch._foreach_zero_(self._grad_acc)   # one multi-tensor kernel, not one per param // 커널 1개
         return self._grad_acc
 
     # --- half_gemm: backward loss scale per term // fp16 GEMM의 backward 언더플로 방지 ---
@@ -183,6 +184,7 @@ class LambdaBalance:
         # half_gemm: .grad holds S × gradient — clip against S × budget, record norm / S, accumulate with 1 / S
         #   (S = 1 leaves every operation as it was). // S배 된 grad를 S배 예산으로 clip, 1/S로 누적
         s = self._BwScale(name)
+        AverageGrads(self.parameters())   # multi-GPU: clip the full batch's gradient, not a rank's (Dist) // rank 평균 후 clip
         pre = torch.nn.utils.clip_grad_norm_(self.parameters(), budget * s).detach()
         if s != 1.0:
             pre = pre / s
@@ -194,12 +196,15 @@ class LambdaBalance:
             zero = torch.zeros_like(nxt)
             self._term_gnorm[name] = torch.where(
                 torch.isfinite(nxt), nxt, prev if prev is not None else zero)
-        for p, a in zip(self.parameters(), acc):
-            if p.grad is not None:
-                if s == 1.0:
-                    a.add_(p.grad)
-                else:
-                    a.add_(p.grad, alpha=1.0 / s)
+        # _foreach_add_: same elementwise add as a per-param add_, in a few multi-tensor kernels (ROCm-FP32-Kernel
+        #   bookkeep A/B 2026-10-20: step 48.99 → 48.11 ms with the other foreach changes) // 파라미터 루프 → 다중 텐서 커널
+        pairs = [(a, p.grad) for p, a in zip(self.parameters(), acc) if p.grad is not None]
+        if pairs:
+            accs, grads = map(list, zip(*pairs))
+            if s == 1.0:
+                torch._foreach_add_(accs, grads)
+            else:
+                torch._foreach_add_(accs, grads, alpha=1.0 / s)
         # set_to_none=False: .grad 텐서를 살려둔 채 0으로만 비운다 → 다음 항의 backward가
         #   같은 버퍼에 누적(재할당 없음). set_to_none=True면 항마다 .grad를 새로 할당한다.
         self.optimizer.zero_grad(set_to_none=False)
@@ -210,15 +215,19 @@ class LambdaBalance:
         # copy_ 필수 — p.grad = a 로 대입하면 p.grad가 누적 버퍼를 **별칭**하게 된다.
         #   버퍼를 재사용하는 지금 그러면 다음 스텝에서 acc is p.grad 가 되어
         #   _FlushTerm의 a.add_(p.grad)가 첫 항을 2배로 세는 조용한 오류가 난다. // no aliasing
+        dst, src = [], []
         for p, a in zip(self.parameters(), acc):
             if p.grad is None:
                 p.grad = a.clone()   # NaN 스킵 경로가 set_to_none=True로 비운 직후 등 // rare
             else:
-                p.grad.copy_(a)
+                dst.append(p.grad); src.append(a)
+        if dst:
+            torch._foreach_copy_(dst, src)   # still a copy, never an alias // 여전히 copy
 
     def _GradNormOfLoss(self, loss):
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward(retain_graph=False)
+        AverageGrads(self.parameters())   # multi-GPU: the full batch's norm // rank 평균 grad의 노름
         gnorm = self._GlobalGradNorm()
         self.optimizer.zero_grad(set_to_none=True)
         return gnorm

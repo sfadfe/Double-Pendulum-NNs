@@ -1,5 +1,6 @@
 import torch
 import torch.func as tf
+from .Dist import World
 from .GraphPass import JointPass
 from .ODE import Rk4Window
 
@@ -143,8 +144,18 @@ class Loss:
         #   keeps its EMA and adds 0; the first batch that has a route seeds its EMA. torch.where only — no host sync.
         # // EMA 비로 경로 1.. 손실을 NF 스케일에 맞춰 더한다. 배치에 없는 경로는 EMA 유지·기여 0
         b = self.trainCfg.class_norm_ema
-        cur = l.detach()
-        has = n > 0
+        if World() > 1:
+            # Multi-GPU: route means over all ranks' rows (Σ n_r·l_r / N), the EMA from those; the rank's l is weighted
+            #   W·n_r / N so its mean over ranks is the full batch's route mean. // 전 rank 행 기준 경로 평균
+            sn = torch.stack([l.detach() * n, n])
+            torch.distributed.all_reduce(sn)
+            n_all = sn[1]
+            cur = sn[0] / n_all.clamp_min(1.0)
+            l = l * (World() * n / n_all.clamp_min(1.0))
+            has = n_all > 0
+        else:
+            cur = l.detach()
+            has = n > 0
         prev = self.__dict__.get("_class_ema")
         seen = self.__dict__.get("_class_seen")
         if prev is None or prev.shape != cur.shape:   # fresh, or a ckpt EMA of another route count // 새로 시작

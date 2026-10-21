@@ -14,9 +14,10 @@ os.environ.setdefault("HIPBLASLT_TUNING_OVERRIDE_FILE", str(Path(__file__).with_
 # 64.7 ms. Same gradients. // backward를 호출 스레드에서 실행: 스레드 넘김(스텝당 7회)과 그에 따른 코어 이동을 없앤다
 torch.autograd.set_multithreading_enabled(False)
 
+from . import Dist
 from .config import CollocCfg, DataCfg, LoadConfig, NetCfg, TrainCfg
 from .Trainer import PINNTrainer
 from .Scheduler import OdeScheduler
 
-__all__ = ["NetCfg", "TrainCfg", "CollocCfg", "DataCfg", "LoadConfig", "PINNTrainer", "OdeScheduler"]
+__all__ = ["Dist", "NetCfg", "TrainCfg", "CollocCfg", "DataCfg", "LoadConfig", "PINNTrainer", "OdeScheduler"]
     

@@ -120,6 +120,10 @@ class NetCfg:
     route_at: int = 0
     route_by: str = "router"
     route_pts: int = 4
+    # route_beta_in (2026-10-22, branch FiLM-MoE): FiLM blocks of routes ≥ 1 (the flip experts) take β inside the
+    #   activation, h ← h + γ·SiLU(W h + b + β), instead of h + γ·SiLU(W h + b) + β. Same parameters and init (β = 0 at
+    #   init); route 0 (nf) and the shared stem unchanged. // flip expert FiLM 블록만 β를 SiLU 안으로. 파라미터·초기값 동일
+    route_beta_in: bool = False
 
     @property
     def gx_dim(self) -> int:
@@ -371,6 +375,7 @@ def LoadConfig(path):
         class_split=n.get("class_split", 0), class_gate_center=n.get("class_gate_center", -0.255),
         class_routes=n.get("class_routes", 2), route_hidden=n.get("route_hidden", 64),
         route_at=n.get("route_at", 0), route_by=n.get("route_by", "router"), route_pts=n.get("route_pts", 4),
+        route_beta_in=n.get("route_beta_in", False),
     )
 
     train_cfg = TrainCfg(

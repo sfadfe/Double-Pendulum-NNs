@@ -150,6 +150,7 @@ class FiLMBlock(nn.Module):
         self.fc1 = nn.Linear(hidden, hidden)
         self.act = _ACTS[act]()
         self.half = False   # branch GEMM in fp16 while grad is enabled (Networks.SetHalf) // 가지 GEMM fp16
+        self.beta_in = False   # h + γ·SiLU(W h + b + β) (NetCfg.route_beta_in, flip experts) // β를 활성 안으로
 
     def Fc1(self, h):
         if self.half and torch.is_grad_enabled():
@@ -157,6 +158,13 @@ class FiLMBlock(nn.Module):
         return self.fc1(h)
 
     def forward(self, h, gamma, beta):
+        if self.beta_in:
+            z = self.Fc1(h)
+            if gamma.shape[0] != h.shape[0]:   # case_group broadcast as below // 아래와 같은 브로드캐스트
+                n, w = gamma.shape[0], h.shape[-1]
+                a = self.act(z.view(n, -1, w) + beta.unsqueeze(1))
+                return (h.view(n, -1, w) + gamma.unsqueeze(1) * a).view(-1, w)
+            return h + gamma * self.act(z + beta)
         a = self.act(self.Fc1(h))
         if gamma.shape[0] != h.shape[0]:
             # One (γ, β) row per case, h case-major with K rows per case (TrainCfg.case_group): broadcast over
@@ -407,6 +415,12 @@ class Networks(nn.Module):
                 self.warps_x = nn.ModuleList([
                     TimeWarp(netCfg.cond_dim, netCfg.warp_hidden, netCfg.warp_k, netCfg.warp_beta_init)
                     for _ in range(self.class_routes - 1)])
+            if netCfg.route_beta_in:   # flip experts' FiLM blocks: β inside SiLU (config.py) // flip expert만 β를 활성 안으로
+                for r in range(1, self.class_routes):
+                    for j, blk in enumerate(self.RouteMods(r)[1]):
+                        blk.beta_in = self.block_types[a + j] == "film"
+        elif netCfg.route_beta_in:
+            raise ValueError("route_beta_in needs class_split > 0")
 
         self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
         self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)

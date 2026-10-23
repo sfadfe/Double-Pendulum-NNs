@@ -124,6 +124,12 @@ class NetCfg:
     #   activation, h ← h + γ·SiLU(W h + b + β), instead of h + γ·SiLU(W h + b) + β. Same parameters and init (β = 0 at
     #   init); route 0 (nf) and the shared stem unchanged. // flip expert FiLM 블록만 β를 SiLU 안으로. 파라미터·초기값 동일
     route_beta_in: bool = False
+    # expert_embed (2026-10-23, branch FiLM-MoE, route_by "gate"): each flip expert (route r ≥ 1) adds its own embedding of
+    #   the window cond x = [trig θ (4), ω/ω_rms (2), NormParams (4)] to the stem output at its entry, h_a + E_r(x),
+    #   E_r = Linear(10, d)-SiLU-Linear(d, width) with the last layer zero-init (identity at init). d = expert_embed,
+    #   0 = off. NormParams ride as 4 case columns before the route column (Dataset.CaseEmb); route 0 (nf) unchanged.
+    # // flip expert 입구에 자기 cond 임베딩을 덧셈 (마지막 층 0 → 시작 시 항등). nf 경로 불변
+    expert_embed: int = 0
 
     @property
     def gx_dim(self) -> int:
@@ -375,7 +381,7 @@ def LoadConfig(path):
         class_split=n.get("class_split", 0), class_gate_center=n.get("class_gate_center", -0.255),
         class_routes=n.get("class_routes", 2), route_hidden=n.get("route_hidden", 64),
         route_at=n.get("route_at", 0), route_by=n.get("route_by", "router"), route_pts=n.get("route_pts", 4),
-        route_beta_in=n.get("route_beta_in", False),
+        route_beta_in=n.get("route_beta_in", False), expert_embed=n.get("expert_embed", 0),
     )
 
     train_cfg = TrainCfg(

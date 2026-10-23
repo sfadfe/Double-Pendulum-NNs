@@ -118,6 +118,8 @@ class Dataset:
             else:
                 gate = (self.ClassGate(ic_state, params_raw) if self.router is None and not self.route_scale
                         else self.RouteOf(ic_state, p_emb, Dedupe=True))
+            if self.x_embed is not None:   # NormParams for the flip experts' entry embeddings (Networks.XEmbedOf) // 입구 임베딩 입력
+                p_emb = torch.cat([p_emb, self.NormParams(params_raw).to(p_emb.dtype)], dim=1)
             p_emb = torch.cat([p_emb, gate.to(p_emb.dtype)], dim=1)
         return p_emb
 
@@ -145,7 +147,7 @@ class Dataset:
         #   gate is conserved, so 2-route nets keep the k0 column). params_raw: gate nets only. // 라운드마다 경로 열 갱신
         if self.route_gate:
             r = (self.TrueRoute(state, params_raw) if self.training
-                 else self.GateRoute(state, params_raw, p_emb[:, :-1]))
+                 else self.GateRoute(state, params_raw, p_emb[:, :self.n_pemb]))
             return torch.cat([p_emb[:, :-1], r.to(p_emb.dtype)], dim=1)
         if self.router is None and not self.route_scale:
             return p_emb

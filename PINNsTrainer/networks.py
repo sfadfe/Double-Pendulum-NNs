@@ -370,7 +370,8 @@ class Networks(nn.Module):
         self.route_gate = self.class_split > 0 and netCfg.route_by == "gate"
         self.route_pts = netCfg.route_pts
         self.n_stem_slots = 0
-        self.routes_x = self.warps_x = self.router = self.gate = None
+        self.routes_x = self.warps_x = self.router = self.gate = self.x_embed = None
+        self.n_cond, self.n_pemb = netCfg.cond_dim, netCfg.param_embed_dim   # FiLM input columns of feats[:, 1:] // FiLM 입력 열 수
         if self.class_split > 0:
             a, k_own = self.route_at, self.class_split
             if (self.n_tok > 0 or self.stage_at or self.film_split_at > 0
@@ -419,8 +420,15 @@ class Networks(nn.Module):
                 for r in range(1, self.class_routes):
                     for j, blk in enumerate(self.RouteMods(r)[1]):
                         blk.beta_in = self.block_types[a + j] == "film"
-        elif netCfg.route_beta_in:
-            raise ValueError("route_beta_in needs class_split > 0")
+            if netCfg.expert_embed > 0:   # flip experts' entry embeddings E_r(x), built last (config.py) // 입구 임베딩, 마지막 생성
+                if not self.route_gate:
+                    raise ValueError("expert_embed needs route_by 'gate'")
+                d = netCfg.expert_embed
+                with torch.random.fork_rng(devices=[]):   # no draws: the other modules' init stays as without it // 난수 분기
+                    self.x_embed = nn.ModuleList([nn.Sequential(nn.Linear(netCfg.ic_feat_dim + 4, d), nn.SiLU(),
+                                                                nn.Linear(d, width)) for _ in range(self.class_routes - 1)])
+        elif netCfg.route_beta_in or netCfg.expert_embed > 0:
+            raise ValueError("route_beta_in / expert_embed need class_split > 0")
 
         self.half_mode = "off"   # fp16 GEMM mode, set by SetHalf (PINNTrainer passes TrainCfg.half_gemm)
         self.group_cond = False  # case-major rows share one cond row per case (PINNTrainer, TrainCfg.case_group)
@@ -431,8 +439,11 @@ class Networks(nn.Module):
         #   nn.Module.reset_parameters()를 모듈마다 부르는 방식은 아래 zero-init 두 개를 덮어써서
         #   FiLM γ가 Kaiming 스케일로 6블록을 곱셈 통과 → h 폭주를 만든다 (adapter도 항등성 상실).
         # Kaiming init for SiLU // Tanh용 Xavier 대신 ReLU-family 휴리스틱
+        #   x_embed (expert_embed) is initialized on a forked RNG below → the draws here and after are as without it
+        # // x_embed는 아래 분기 난수로 → 여기와 이후 난수는 그것이 없을 때와 같다
+        skip = {id(m) for m in self.x_embed.modules()} if self.x_embed is not None else set()
         for m in self.modules():
-            if isinstance(m, nn.Linear):
+            if isinstance(m, nn.Linear) and id(m) not in skip:
                 nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 nn.init.zeros_(m.bias)
 
@@ -491,6 +502,13 @@ class Networks(nn.Module):
         if self.gate is not None:   # equal logits → no CE gradient into the stem at init // 시작 시 몸통 CE gradient 0
             nn.init.zeros_(self.gate[-1].weight)
             nn.init.zeros_(self.gate[-1].bias)
+        # Expert entry embeddings: Kaiming first layer, zero output → h_a unchanged at init // 시작 시 입구 덧셈 0
+        with torch.random.fork_rng(devices=[]):
+            for emb in self.x_embed or ():
+                nn.init.kaiming_normal_(emb[0].weight, mode="fan_in", nonlinearity="relu")
+                nn.init.zeros_(emb[0].bias)
+                nn.init.zeros_(emb[-1].weight)
+                nn.init.zeros_(emb[-1].bias)
 
     def SetHalf(self, mode):
         # fp16 GEMMs (TrainCfg.half_gemm): "off" | "blk" (block branch fc1) | "blk+film" (+ FiLM last layer)
@@ -646,15 +664,16 @@ class Networks(nn.Module):
         # // 워프가 켜지면 (γ, β, wp) 3원소 — 호출부는 2개 언패킹 금지, 튜플째로 넘긴다
         c = feats[:, 1:]
         if self.class_split > 0:   # last column = route id, not a cond input // 마지막 열 = 경로 id (cond 아님)
+            #   expert_embed: NormParams (4) sit between the cond columns and the route id // 그 사이 NormParams 4열
             r = c[:, -1:].round().unsqueeze(-1)
-            ga, ba = self.film(c[:, :-1])
+            ga, ba = self.film(c[:, :self.n_cond])
             ns = self.n_stem_slots
             for k in range(1, self.class_routes):
-                gk, bk = self.RouteMods(k)[2](c[:, :-1])
+                gk, bk = self.RouteMods(k)[2](c[:, :self.n_cond])
                 if ns > 0:   # stem slots stay shared // 몸통 슬롯은 공유 FiLMCond
                     gk, bk = torch.cat([ga[:, :ns], gk], dim=1), torch.cat([ba[:, :ns], bk], dim=1)
                 ga, ba = torch.where(r == k, gk, ga), torch.where(r == k, bk, ba)
-            return ga, ba, *self.WarpOf(c)
+            return ga, ba, *self.WarpOf(c), *self.XEmbedOf(c)
         if self.film_corr is None:
             return self.film(c) + self.WarpOf(c)
         ga, ba = self.film(c)                          # 예측 구간 슬롯
@@ -669,10 +688,23 @@ class Networks(nn.Module):
         if self.class_split <= 0:
             return (self.time_warp(c),)
         r = c[:, -1:].round().unsqueeze(-1)
-        wp = self.time_warp(c[:, :-1])
+        wp = self.time_warp(c[:, :self.n_cond])
         for k in range(1, self.class_routes):
-            wp = torch.where(r == k, self.warps_x[k - 1](c[:, :-1]), wp)
+            wp = torch.where(r == k, self.warps_x[k - 1](c[:, :self.n_cond]), wp)
         return (wp,)
+
+    def XEmbedOf(self, c):
+        # () or (e,), e (N, width) = E_r(x) of the row's flip expert r (route 0 rows get E_1, unused), x = [trig θ, ω/ω_rms,
+        #   NormParams] — last element of the cond tuple, added at the flip experts' entry in _Core (config.py expert_embed).
+        # // 행의 flip expert 입구 임베딩 — cond 튜플 마지막 원소
+        if self.x_embed is None:
+            return ()
+        r = c[:, -1:].round()
+        x = torch.cat([c[:, :self.n_cond - self.n_pemb], c[:, self.n_cond:self.n_cond + 4]], dim=1)
+        e = self.x_embed[0](x)
+        for k in range(2, self.class_routes):
+            e = torch.where(r == k, self.x_embed[k - 1](x), e)
+        return (e,)
 
     def CaseCond(self, feats, n_q):
         # CondOf for forward: one row per case when group_cond is on and the rows are case-major groups of n_q,
@@ -729,9 +761,14 @@ class Networks(nn.Module):
             h_stem = h
             for i in range(a, a + k_own):
                 h = self.ApplyBlock(i, h, gammas, betas, n_q)
+            e = cond[-1] if self.x_embed is not None else None   # flip experts' entry embedding (XEmbedOf) // 입구 임베딩
+            if e is not None and e.shape[0] != h.shape[0]:      # case_group: one row per case // 케이스당 1행 → 행 수로
+                e = e.repeat_interleave(h.shape[0] // e.shape[0], dim=0)
             for k in range(1, self.class_routes):
                 proj, blocks = self.RouteMods(k)[:2]
                 hk = h_stem if proj is None else proj(x)
+                if e is not None:
+                    hk = hk + e
                 for i in range(a, a + k_own):
                     hk = self._ApplyFront(blocks, i, hk, gammas, betas)
                 h = torch.where(r == k, hk, h)
